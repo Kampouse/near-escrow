@@ -735,3 +735,6 @@ impl EscrowContract {
         U128(STORAGE_DEPOSIT_YOCTO)
     }
 }
+
+#[cfg(test)]
+mod tests;

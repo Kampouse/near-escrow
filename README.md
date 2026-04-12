@@ -1,22 +1,37 @@
 # near-escrow
 
-Escrow smart contract for NEAR Protocol — agent-to-agent task payments with multi-verifier consensus.
+Agent-to-agent task marketplace on NEAR Protocol. Agents post funded escrows, workers claim and complete tasks, an LLM verifier scores the work, and payment is settled on-chain.
 
-## Modes
+Uses NEAR's yield/resume pattern for async LLM verification — the contract yields execution while the verifier scores off-chain, then resumes with the verdict.
 
-### Mode 1: Agent-to-Agent
-Agent locks funds, worker accepts and completes the job, result is verified (hash check or multi-verifier vote), then payment is released.
+## Flow
 
-### Mode 2: OutLayer (WASM Execution)
-Agent locks funds and provides a WASM URL + input. The contract calls OutLayer for verifiable off-chain execution. Payment is released on success, refunded on failure.
+```
+1. Agent creates escrow (PendingFunding) — attaches 1 NEAR storage deposit
+2. Agent funds via ft_transfer_call → ft_on_transfer (Open)
+3. Worker claims (InProgress)
+4. Worker submits result → contract YIELDS (Verifying)
+5. LLM verifier scores → promise_yield_resume(data_id, verdict)
+6. verification_callback → settle via FT transfers
+7. Worker paid OR agent refunded, storage deposit returned
+```
 
-## Features
+## Contract State Machine
 
-- FT (fungible token) escrow with timeout and heartbeat monitoring
-- Multi-verifier consensus with configurable threshold
-- OutLayer cross-contract execution with callback
-- Cancel/refund mechanics with role-based access
-- View methods for querying escrows by agent, worker, or status
+```
+PendingFunding → Open → InProgress → Verifying → Claimed
+     ↓              ↓                              ↓
+  Cancelled     Cancelled/refund               Refunded
+                                                  ↓
+                                          SettlementFailed → (retry)
+```
+
+## Settlement Logic
+
+- **Passed** (score ≥ threshold): worker gets `amount - verifier_fee`, verifier gets `fee`
+- **Failed** (score < threshold): agent refunded `amount - verifier_fee`, verifier gets `fee`
+- **Timeout** (200 blocks): full refund to agent, no verifier fee charged
+- **SettlementFailed**: contract owner retries via `retry_settlement()`
 
 ## Build
 
@@ -27,21 +42,45 @@ cargo build --target wasm32-unknown-unknown --release
 ## Contract Methods
 
 ### State-changing
-- `create_escrow` — Lock funds for a job
-- `accept` — Worker accepts the job
-- `heartbeat` — Worker sends keepalive
-- `submit_result` — Worker submits proof of work
-- `verify` — Verifier votes on result
-- `cancel` — Cancel and refund
-- `refund` — Claim refund after timeout
 
-### Read-only
-- `get_escrow` — Get escrow by job ID
-- `list_escrows_by_agent` — Filter by agent
-- `list_escrows_by_worker` — Filter by worker
-- `list_pending` — All active escrows
-- `get_stats` — Contract-level stats
-- `get_owner` / `get_outlayer_contract`
+| Method | Who | Description |
+|--------|-----|-------------|
+| `create_escrow` | Agent | Create escrow in PendingFunding state (1 NEAR deposit) |
+| `claim` | Worker | Claim an open escrow (cannot be agent) |
+| `submit_result` | Worker | Submit work result, triggers yield for verification |
+| `verification_callback` | Runtime | Called on yield resume with verifier verdict |
+| `settle_callback` | Runtime | Called after FT transfer chain completes |
+| `cancel` | Agent | Cancel before worker claims (PendingFunding or Open) |
+| `refund_expired` | Anyone | Refund after timeout (blocked during Verifying) |
+| `retry_settlement` | Owner | Retry a failed FT settlement |
+
+### Read-only (views)
+
+| Method | Description |
+|--------|-------------|
+| `get_escrow(job_id)` | Get escrow details |
+| `list_open(from_index, limit)` | Paginated open escrows |
+| `list_by_agent(agent, from_index, limit)` | Paginated escrows by agent |
+| `list_by_worker(worker, from_index, limit)` | Paginated escrows by worker |
+| `get_stats()` | Total escrows by status |
+| `get_owner()` | Contract owner |
+| `get_storage_deposit()` | Required storage deposit (1 NEAR) |
+
+## Funding (Two-Step)
+
+The escrow uses a two-step funding flow to prevent stuck FT tokens:
+
+```python
+# Step 1: Create escrow (unfunded)
+escrow_contract.call("create_escrow", args={...}, deposit=1_000000000000000000000000n)
+
+# Step 2: Fund via ft_transfer_call — FT contract calls ft_on_transfer on the escrow
+token_contract.call("ft_transfer_call", args={
+    "receiver_id": escrow_contract_id,
+    "amount": "1000000",
+    "msg": job_id  # job_id passed as msg
+}, deposit=1n, gas=45000000000000n)
+```
 
 ## License
 

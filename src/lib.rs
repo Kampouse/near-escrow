@@ -367,7 +367,34 @@ impl EscrowContract {
     }
 
     // ========================================
-    // 5. LLM Verifier resumes → callback
+    // 5a. LLM Verifier calls resume_verification
+    // ========================================
+
+    /// Called by the verifier service to deliver the verdict.
+    /// Internally calls env::promise_yield_resume() which triggers
+    /// verification_callback as the yield completion.
+    ///
+    /// Args:
+    ///   data_id_hex — hex-encoded CryptoHash from the `result_submitted` event
+    ///   verdict — JSON string: {"score": 85, "passed": true, "detail": "..."}
+    pub fn resume_verification(&mut self, data_id_hex: String, verdict: String) -> bool {
+        // Decode hex data_id to bytes
+        let data_id_bytes: Vec<u8> = (0..data_id_hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&data_id_hex[i..i + 2], 16).unwrap_or(0))
+            .collect();
+
+        let data_id: [u8; 32] = data_id_bytes
+            .try_into()
+            .expect("data_id must be 32 bytes");
+
+        let payload = verdict.as_bytes();
+
+        env::promise_yield_resume(&data_id, payload)
+    }
+
+    // ========================================
+    // 5b. Yield callback — verification_callback
     // ========================================
 
     /// Called by NEAR runtime when verifier service calls promise_yield_resume(data_id, payload).

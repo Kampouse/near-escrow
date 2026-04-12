@@ -1,0 +1,10 @@
+{
+  "network": "testnet",
+  "rpc_url": "https://rpc.testnet.near.org",
+  "contract_id": "escrow.testnet",
+  "verifier_account_id": "verifier.testnet",
+  "gemini_model": "gemini-2.5-flash",
+  "poll_interval_seconds": 3,
+  "verification_passes": 4,
+  "default_threshold": 80
+}

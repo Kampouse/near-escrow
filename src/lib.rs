@@ -11,6 +11,11 @@ const GAS_FOR_SETTLE_CALLBACK: Gas = Gas::from_tgas(10);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 const DATA_ID_REGISTER: u64 = 0;
 
+// Storage deposit per escrow (100 NEAR * 10^24 yocto = generous overestimate).
+// Covers the Escrow struct + UnorderedMap entry overhead.
+// Surplus is refunded on settle/cancel.
+const STORAGE_DEPOSIT_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
+
 // --- Verifier verdict ---
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Clone, Debug)]
@@ -44,9 +49,9 @@ pub enum EscrowStatus {
 #[borsh(crate = "near_sdk::borsh")]
 #[serde(crate = "near_sdk::serde")]
 pub enum SettlementTarget {
-    Claim,       // Pay worker minus verifier fee
-    Refund,      // Refund agent minus verifier fee
-    FullRefund,  // Full refund (timeout or cancel)
+    Claim,      // Pay worker minus verifier fee
+    Refund,     // Refund agent minus verifier fee
+    FullRefund, // Full refund (timeout or cancel)
 }
 
 // --- Escrow record (internal) ---
@@ -153,7 +158,6 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub struct EscrowContract {
     owner: AccountId,
     escrows: UnorderedMap<String, Escrow>,
-    verifiers: Vec<AccountId>,
 }
 
 impl Default for EscrowContract {
@@ -161,7 +165,6 @@ impl Default for EscrowContract {
         Self {
             owner: "root".parse().unwrap(),
             escrows: UnorderedMap::new(b"e"),
-            verifiers: Vec::new(),
         }
     }
 }
@@ -169,11 +172,10 @@ impl Default for EscrowContract {
 #[near]
 impl EscrowContract {
     #[init]
-    pub fn new(verifiers: Option<Vec<AccountId>>) -> Self {
+    pub fn new() -> Self {
         Self {
             owner: env::signer_account_id(),
             escrows: UnorderedMap::new(b"e"),
-            verifiers: verifiers.unwrap_or_default(),
         }
     }
 
@@ -182,8 +184,8 @@ impl EscrowContract {
     // ========================================
 
     /// Creates an escrow in PendingFunding state.
+    /// Requires attached NEAR deposit for storage (1 NEAR, surplus refunded on settle).
     /// Agent must then call ft_transfer_call(token, this_contract, amount, job_id) to fund it.
-    /// ft_on_transfer will transition it to Open.
     pub fn create_escrow(
         &mut self,
         job_id: String,
@@ -202,6 +204,10 @@ impl EscrowContract {
 
         let vfee = verifier_fee.unwrap_or(U128(0));
         assert!(vfee.0 < amount.0, "Verifier fee must be less than amount");
+
+        // Storage staking: require deposit, refund surplus on settle/cancel
+        let attached = env::attached_deposit().as_yoctonear();
+        assert!(attached >= STORAGE_DEPOSIT_YOCTO, "Insufficient storage deposit: attach at least 1 NEAR");
 
         let escrow = Escrow {
             job_id: job_id.clone(),
@@ -247,12 +253,7 @@ impl EscrowContract {
     /// Transitions escrow from PendingFunding → Open.
     ///
     /// Returns U128(0) to accept all tokens, or U128(amount) to reject.
-    pub fn ft_on_transfer(
-        &mut self,
-        sender_id: AccountId,
-        amount: U128,
-        msg: String,
-    ) -> U128 {
+    pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> U128 {
         let token_contract = env::predecessor_account_id();
         let job_id = msg;
 
@@ -293,12 +294,14 @@ impl EscrowContract {
     // 3. Worker claims
     // ========================================
 
-    /// Worker (found task via Nostr/FastNear) claims the job
+    /// Worker (found task via Nostr/FastNear) claims the job.
+    /// Agent cannot claim their own escrow.
     pub fn claim(&mut self, job_id: String) {
         let caller = env::signer_account_id();
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
         assert!(escrow.status == EscrowStatus::Open, "Not open");
         assert!(escrow.worker.is_none(), "Already claimed");
+        assert_ne!(caller, escrow.agent, "Agent cannot claim own escrow");
 
         escrow.worker = Some(caller.clone());
         escrow.status = EscrowStatus::InProgress;
@@ -497,7 +500,7 @@ impl EscrowContract {
     }
 
     /// Callback after FT transfer chain completes.
-    /// On success → final status (Claimed/Refunded).
+    /// On success → final status (Claimed/Refunded) + storage deposit refund.
     /// On failure → SettlementFailed (admin retries via retry_settlement).
     pub fn settle_callback(
         &mut self,
@@ -516,6 +519,11 @@ impl EscrowContract {
                     }
                 };
                 escrow.settlement_target = None;
+
+                // Refund storage deposit to agent
+                let _ = Promise::new(escrow.agent.clone()).transfer(NearToken::from_yoctonear(
+                    STORAGE_DEPOSIT_YOCTO,
+                ));
 
                 emit_event(
                     "escrow_settled",
@@ -551,10 +559,7 @@ impl EscrowContract {
             escrow.status == EscrowStatus::SettlementFailed,
             "Not in SettlementFailed"
         );
-        assert!(
-            escrow.settlement_target.is_some(),
-            "No settlement target"
-        );
+        assert!(escrow.settlement_target.is_some(), "No settlement target");
         self._settle_escrow(&job_id);
     }
 
@@ -563,7 +568,7 @@ impl EscrowContract {
     // ========================================
 
     /// Agent cancels before funding or before worker claims.
-    /// PendingFunding → Cancelled (no funds to move).
+    /// PendingFunding → Cancelled + storage deposit refund (no FT to move).
     /// Open → FullRefund via settlement (funds locked, need FT transfer back).
     pub fn cancel(&mut self, job_id: String) {
         let caller = env::signer_account_id();
@@ -574,6 +579,9 @@ impl EscrowContract {
             EscrowStatus::PendingFunding => {
                 escrow.status = EscrowStatus::Cancelled;
                 self.escrows.insert(&job_id, &escrow);
+                // Refund storage deposit
+                let _ = Promise::new(escrow.agent.clone())
+                    .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
                 emit_event(
                     "escrow_cancelled",
                     &serde_json::json!({"job_id": job_id}),
@@ -589,9 +597,9 @@ impl EscrowContract {
     }
 
     /// Anyone can refund an expired escrow.
-    /// PendingFunding → Cancelled (no funds).
+    /// PendingFunding → Cancelled + storage refund (no FT).
     /// Open / InProgress → FullRefund via settlement.
-    /// Verifying → REJECTED — yield timeout (200 blocks) handles this via verification_callback Err branch.
+    /// Verifying → REJECTED — yield timeout handles this.
     pub fn refund_expired(&mut self, job_id: String) {
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
         let now = env::block_timestamp_ms();
@@ -601,6 +609,8 @@ impl EscrowContract {
             EscrowStatus::PendingFunding => {
                 escrow.status = EscrowStatus::Cancelled;
                 self.escrows.insert(&job_id, &escrow);
+                let _ = Promise::new(escrow.agent.clone())
+                    .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
                 emit_event(
                     "escrow_cancelled",
                     &serde_json::json!({
@@ -614,9 +624,6 @@ impl EscrowContract {
                 self.escrows.insert(&job_id, &escrow);
                 self._settle_escrow(&job_id);
             }
-            // FIX #3: Verifying escrows are NOT refundable.
-            // The yield timeout (~200 blocks) fires verification_callback with Err,
-            // which triggers FullRefund through the settlement path.
             EscrowStatus::Verifying => {
                 panic!("Cannot refund while verifying — yield timeout handles this");
             }
@@ -625,52 +632,58 @@ impl EscrowContract {
     }
 
     // ========================================
-    // Admin
-    // ========================================
-
-    pub fn add_verifier(&mut self, verifier: AccountId) {
-        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
-        assert!(!self.verifiers.contains(&verifier), "Already a verifier");
-        self.verifiers.push(verifier);
-    }
-
-    pub fn remove_verifier(&mut self, verifier: AccountId) {
-        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
-        self.verifiers.retain(|v| v != &verifier);
-    }
-
-    pub fn get_verifiers(&self) -> Vec<AccountId> {
-        self.verifiers.clone()
-    }
-
-    // ========================================
-    // Views — no data_id exposed
+    // Views — paginated, no data_id exposed
     // ========================================
 
     pub fn get_escrow(&self, job_id: String) -> Option<EscrowView> {
         self.escrows.get(&job_id).map(|e| e.into())
     }
 
-    pub fn list_open(&self) -> Vec<EscrowView> {
+    /// Paginated list of open escrows. Pass from_index=0, limit=50 for first page.
+    pub fn list_open(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<EscrowView> {
+        let from = from_index.unwrap_or(0);
+        let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
+            .skip(from as usize)
             .filter(|(_, e)| e.status == EscrowStatus::Open)
+            .take(max as usize)
             .map(|(_, e)| e.into())
             .collect()
     }
 
-    pub fn list_by_agent(&self, agent: AccountId) -> Vec<EscrowView> {
+    /// Paginated list of escrows by agent.
+    pub fn list_by_agent(
+        &self,
+        agent: AccountId,
+        from_index: Option<u64>,
+        limit: Option<u64>,
+    ) -> Vec<EscrowView> {
+        let from = from_index.unwrap_or(0);
+        let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
+            .skip(from as usize)
             .filter(|(_, e)| e.agent == agent)
+            .take(max as usize)
             .map(|(_, e)| e.into())
             .collect()
     }
 
-    pub fn list_by_worker(&self, worker: AccountId) -> Vec<EscrowView> {
+    /// Paginated list of escrows by worker.
+    pub fn list_by_worker(
+        &self,
+        worker: AccountId,
+        from_index: Option<u64>,
+        limit: Option<u64>,
+    ) -> Vec<EscrowView> {
+        let from = from_index.unwrap_or(0);
+        let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
+            .skip(from as usize)
             .filter(|(_, e)| e.worker.as_ref() == Some(&worker))
+            .take(max as usize)
             .map(|(_, e)| e.into())
             .collect()
     }
@@ -689,5 +702,9 @@ impl EscrowContract {
 
     pub fn get_owner(&self) -> AccountId {
         self.owner.clone()
+    }
+
+    pub fn get_storage_deposit(&self) -> U128 {
+        U128(STORAGE_DEPOSIT_YOCTO)
     }
 }

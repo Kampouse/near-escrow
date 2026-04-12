@@ -478,6 +478,7 @@ impl EscrowContract {
     // ========================================
 
     /// Chains FT transfers and attaches a settle_callback to handle success/failure.
+    /// Uses Promise::all() to batch transfers so the callback sees all results.
     /// If all transfers succeed → final status (Claimed/Refunded).
     /// If any transfer fails → SettlementFailed (admin can retry).
     fn _settle_escrow(&mut self, job_id: &str) {
@@ -488,8 +489,37 @@ impl EscrowContract {
         let total = escrow.amount.0;
         let vfee = escrow.verifier_fee.0;
 
-        let settle_args =
-            serde_json::to_vec(&serde_json::json!({"job_id": job_id})).unwrap();
+        // Build transfer promises
+        let transfers: Vec<Promise> = match target {
+            SettlementTarget::Claim => {
+                let worker = escrow.worker.clone().expect("No worker for claim");
+                let payout = total.saturating_sub(vfee);
+                assert!(payout > 0, "Worker payout is zero");
+
+                let mut ps = vec![ft_transfer_promise(&token, worker, payout)];
+                if vfee > 0 {
+                    ps.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
+                }
+                ps
+            }
+            SettlementTarget::Refund => {
+                let refund = total.saturating_sub(vfee);
+                assert!(refund > 0, "Agent refund is zero");
+
+                let mut ps = vec![ft_transfer_promise(&token, escrow.agent.clone(), refund)];
+                if vfee > 0 {
+                    ps.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
+                }
+                ps
+            }
+            SettlementTarget::FullRefund => {
+                assert!(total > 0, "Nothing to refund");
+                vec![ft_transfer_promise(&token, escrow.agent.clone(), total)]
+            }
+        };
+
+        // Batch all transfers via .and() for parallel execution, then callback
+        let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).unwrap();
         let settle_cb = Promise::new(env::current_account_id()).function_call(
             "settle_callback".to_string(),
             settle_args,
@@ -497,79 +527,46 @@ impl EscrowContract {
             GAS_FOR_SETTLE_CALLBACK,
         );
 
-        match target {
-            SettlementTarget::Claim => {
-                let worker = escrow.worker.clone().expect("No worker for claim");
-                let payout = total.saturating_sub(vfee);
-                assert!(payout > 0, "Worker payout is zero");
-
-                let mut chain = ft_transfer_promise(&token, worker, payout);
-                if vfee > 0 {
-                    chain = chain.then(ft_transfer_promise(&token, self.owner.clone(), vfee));
-                }
-                let _ = chain.then(settle_cb);
-            }
-            SettlementTarget::Refund => {
-                let refund = total.saturating_sub(vfee);
-                assert!(refund > 0, "Agent refund is zero");
-
-                let mut chain = ft_transfer_promise(&token, escrow.agent.clone(), refund);
-                if vfee > 0 {
-                    chain = chain.then(ft_transfer_promise(&token, self.owner.clone(), vfee));
-                }
-                let _ = chain.then(settle_cb);
-            }
-            SettlementTarget::FullRefund => {
-                assert!(total > 0, "Nothing to refund");
-                let _ = ft_transfer_promise(&token, escrow.agent.clone(), total).then(settle_cb);
-            }
-        }
+        // Join all transfers with .and(), then chain the callback
+        let batch = transfers
+            .into_iter()
+            .reduce(|acc, p| acc.and(p))
+            .expect("At least one transfer required");
+        let _ = batch.then(settle_cb);
     }
 
-    /// Callback after FT transfer chain completes.
+    /// Callback after FT transfer batch completes.
+    /// Uses #[callback_vec] to collect all results from the .and() batch.
+    /// All transfers must succeed — if any fails, the callback panics (reverts state),
+    /// and the admin can retry via retry_settlement().
     /// On success → final status (Claimed/Refunded) + storage deposit refund.
-    /// On failure → SettlementFailed (admin retries via retry_settlement).
     pub fn settle_callback(
         &mut self,
         job_id: String,
-        #[callback_result] _result: Result<Vec<u8>, PromiseError>,
+        #[callback_vec] _results: Vec<Vec<u8>>,
     ) {
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
-        let target = escrow.settlement_target.clone();
+        let target = escrow.settlement_target.clone().expect("No settlement target");
 
-        match (_result, target) {
-            (Ok(_), Some(t)) => {
-                escrow.status = match t {
-                    SettlementTarget::Claim => EscrowStatus::Claimed,
-                    SettlementTarget::Refund | SettlementTarget::FullRefund => {
-                        EscrowStatus::Refunded
-                    }
-                };
-                escrow.settlement_target = None;
-
-                // Refund storage deposit to agent
-                let _ = Promise::new(escrow.agent.clone()).transfer(NearToken::from_yoctonear(
-                    STORAGE_DEPOSIT_YOCTO,
-                ));
-
-                emit_event(
-                    "escrow_settled",
-                    &serde_json::json!({
-                        "job_id": job_id,
-                        "status": format!("{:?}", escrow.status),
-                    }),
-                );
+        escrow.status = match target {
+            SettlementTarget::Claim => EscrowStatus::Claimed,
+            SettlementTarget::Refund | SettlementTarget::FullRefund => {
+                EscrowStatus::Refunded
             }
-            _ => {
-                // Transfer failed — mark for admin retry
-                escrow.status = EscrowStatus::SettlementFailed;
+        };
+        escrow.settlement_target = None;
 
-                emit_event(
-                    "settlement_failed",
-                    &serde_json::json!({"job_id": job_id}),
-                );
-            }
-        }
+        // Refund storage deposit to agent
+        let _ = Promise::new(escrow.agent.clone())
+            .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
+
+        emit_event(
+            "escrow_settled",
+            &serde_json::json!({
+                "job_id": job_id,
+                "status": format!("{:?}", escrow.status),
+            }),
+        );
 
         self.escrows.insert(&job_id, &escrow);
     }
@@ -666,20 +663,20 @@ impl EscrowContract {
         self.escrows.get(&job_id).map(|e| e.into())
     }
 
-    /// Paginated list of open escrows. Pass from_index=0, limit=50 for first page.
+    /// Paginated list of open escrows. Skips `from_index` matching entries.
     pub fn list_open(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<EscrowView> {
         let from = from_index.unwrap_or(0);
         let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
-            .skip(from as usize)
             .filter(|(_, e)| e.status == EscrowStatus::Open)
+            .skip(from as usize)
             .take(max as usize)
             .map(|(_, e)| e.into())
             .collect()
     }
 
-    /// Paginated list of escrows by agent.
+    /// Paginated list of escrows by agent. Skips `from_index` matching entries.
     pub fn list_by_agent(
         &self,
         agent: AccountId,
@@ -690,14 +687,14 @@ impl EscrowContract {
         let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
-            .skip(from as usize)
             .filter(|(_, e)| e.agent == agent)
+            .skip(from as usize)
             .take(max as usize)
             .map(|(_, e)| e.into())
             .collect()
     }
 
-    /// Paginated list of escrows by worker.
+    /// Paginated list of escrows by worker. Skips `from_index` matching entries.
     pub fn list_by_worker(
         &self,
         worker: AccountId,
@@ -708,10 +705,28 @@ impl EscrowContract {
         let max = limit.unwrap_or(50).min(100);
         self.escrows
             .iter()
-            .skip(from as usize)
             .filter(|(_, e)| e.worker.as_ref() == Some(&worker))
+            .skip(from as usize)
             .take(max as usize)
             .map(|(_, e)| e.into())
+            .collect()
+    }
+
+    /// List escrows in Verifying state with their data_id (for verifier service).
+    pub fn list_verifying(&self) -> Vec<serde_json::Value> {
+        self.escrows
+            .iter()
+            .filter(|(_, e)| e.status == EscrowStatus::Verifying)
+            .map(|(_, e)| {
+                serde_json::json!({
+                    "job_id": e.job_id,
+                    "data_id": e.data_id.map(|id| hex_encode(id.as_ref())),
+                    "task_description": e.task_description,
+                    "criteria": e.criteria,
+                    "score_threshold": e.score_threshold,
+                    "result": e.result,
+                })
+            })
             .collect()
     }
 

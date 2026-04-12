@@ -65,7 +65,7 @@ def process_verifying_escrow(
     scorer: Scorer,
 ) -> bool:
     """Process a single verifying escrow. Returns True on success."""
-    # 1. Fetch escrow state
+    # Fetch full escrow state for task/criteria
     escrow = near.get_escrow(job_id)
     if not escrow:
         log.error("Escrow %s not found", job_id)
@@ -89,7 +89,7 @@ def process_verifying_escrow(
         job_id, threshold, criteria[:60],
     )
 
-    # 2. Score the work
+    # Score the work
     verdict = scorer.score(
         task_description=task_description,
         criteria=criteria,
@@ -102,7 +102,7 @@ def process_verifying_escrow(
         job_id, verdict["score"], verdict["passed"],
     )
 
-    # 3. Deliver verdict via promise_yield_resume
+    # Deliver verdict via promise_yield_resume
     payload = json.dumps({
         "score": verdict["score"],
         "passed": verdict["passed"],
@@ -154,27 +154,32 @@ def main():
     )
     log.info("Model: %s, passes: %d", scorer.model, scorer.passes)
 
-    # Track last processed timestamp to avoid re-processing
-    last_timestamp_ns = 0
+    # Track processed job IDs to avoid re-processing
+    # Bounded: trim oldest when exceeding 10k entries
+    processed: set[str] = set()
+    MAX_PROCESSED = 10_000
 
     while True:
         try:
-            # Poll for new result_submitted events
-            events = near.get_recent_result_submitted_events(last_timestamp_ns)
+            # Poll for verifying escrows directly from contract state
+            verifying = near.get_verifying_escrows()
 
-            if not events:
+            if not verifying:
                 if args.once:
                     log.info("No pending verifications")
                     break
                 time.sleep(poll_interval)
                 continue
 
-            for event in events:
-                job_id = event.get("job_id")
-                data_id = event.get("data_id")
+            for escrow in verifying:
+                job_id = escrow.get("job_id")
+                data_id = escrow.get("data_id")
 
                 if not job_id or not data_id:
-                    log.warning("Malformed event: %s", event)
+                    log.warning("Malformed verifying entry: %s", escrow)
+                    continue
+
+                if job_id in processed:
                     continue
 
                 log.info("Found verifying escrow: %s (data_id=%s)", job_id, data_id)
@@ -182,7 +187,12 @@ def main():
                 success = process_verifying_escrow(job_id, data_id, near, scorer)
 
                 if success:
-                    last_timestamp_ns = event.get("_timestamp_ns", last_timestamp_ns)
+                    processed.add(job_id)
+                    if len(processed) > MAX_PROCESSED:
+                        # Evict oldest half
+                        evict_count = len(processed) // 2
+                        for _ in range(evict_count):
+                            processed.discard(next(iter(processed)))
 
             if args.once:
                 break

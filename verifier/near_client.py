@@ -53,73 +53,25 @@ class NearClient:
     # Event polling — scan recent blocks for result_submitted events
     # ------------------------------------------------------------------
 
-    def get_recent_result_submitted_events(
-        self, after_timestamp_ns: int
-    ) -> list[dict]:
-        """Fetch recent blocks and scan logs for `result_submitted` events.
+    def get_verifying_escrows(self) -> list[dict]:
+        """Fetch escrows in Verifying state directly from contract view.
 
-        Events follow the NEAR Events standard:
-        {
-          "standard": "escrow",
-          "version": "3.0.0",
-          "event": "result_submitted",
-          "data": [{"job_id": "...", "data_id": "..."}]
-        }
-
-        For production, replace this with a FastNear indexer subscription.
+        Uses the list_verifying() view method which returns job_id + data_id + result.
+        No block scanning needed.
         """
-        events = []
-
-        status = self.provider.get_status()
-        latest_height = int(status["sync_info"]["latest_block_height"])
-
-        # Scan last ~200 blocks (~2 min — matches yield timeout window)
-        start = max(0, latest_height - 200)
-
-        for height in range(start, latest_height + 1):
-            try:
-                block = self.provider.get_block(height)
-                block_ts = int(block["header"]["timestamp_nanosec"])
-                if block_ts <= after_timestamp_ns:
-                    continue
-
-                for chunk_info in block.get("chunks", []):
-                    if not chunk_info.get("tx_root") or chunk_info["tx_root"] == "11111111111111111111111111111111":
-                        continue
-                    try:
-                        chunk = self.provider.get_chunk(chunk_info["chunk_hash"])
-                    except Exception:
-                        continue
-
-                    for tx in chunk.get("transactions", []):
-                        if tx.get("receiver_id") != self.contract_id:
-                            continue
-                        try:
-                            receipt = self.provider.get_tx(tx["hash"], tx["signer_id"])
-                            for outcome in receipt.get("receipts_outcome", []):
-                                for log_line in outcome.get("outcome", {}).get("logs", []):
-                                    event = self._parse_event(log_line)
-                                    if event and event.get("event") == "result_submitted":
-                                        for d in event.get("data", []):
-                                            d["_block_height"] = height
-                                            d["_timestamp_ns"] = block_ts
-                                            events.append(d)
-                        except Exception:
-                            continue
-            except Exception:
-                continue
-
-        return events
-
-    @staticmethod
-    def _parse_event(log_line: str) -> Optional[dict]:
-        """Parse a NEAR Events standard log line."""
-        if not log_line.startswith("EVENT_JSON:"):
-            return None
         try:
-            return json.loads(log_line[len("EVENT_JSON:"):])
-        except (json.JSONDecodeError, ValueError):
-            return None
+            result = self.provider.view_call(
+                self.contract_id,
+                "list_verifying",
+                b"",
+            )
+            if result.get("result"):
+                data = bytes(result["result"]).decode()
+                if data and data != "null":
+                    return json.loads(data)
+        except Exception as e:
+            log.warning("view_call list_verifying failed: %s", e)
+        return []
 
     # ------------------------------------------------------------------
     # Resume — deliver verdict to contract
@@ -139,10 +91,10 @@ class NearClient:
         Returns:
             Transaction hash
         """
-        args = json.dumps({
+        args = {
             "data_id_hex": data_id_hex,
             "verdict": verdict,
-        }).encode("utf-8")
+        }
 
         result = self.account.function_call(
             self.contract_id,

@@ -35,7 +35,7 @@ Worker paid OR agent refunded, verifier fee paid, storage refunded
 - `submit_result()` — stores result, creates yield promise, emits `result_submitted` with data_id
 - `resume_verification(data_id_hex, verdict)` — verifier delivers verdict, calls `promise_yield_resume`
 - `verification_callback()` — resumed by yield, validates score consistency, chains settlement
-- `_settle_escrow()` + `settle_callback()` — FT transfers via `.and()` batch + `#[callback_vec]`
+- `_settle_escrow()` + `settle_callback()` — FT transfers batched via `.and()`, callback checks all results manually
 - `cancel()` — PendingFunding (storage refund) or Open (FT refund via settlement)
 - `refund_expired()` — anyone can call after timeout (blocked during Verifying)
 - `retry_settlement()` — owner can retry failed FT transfers
@@ -122,20 +122,47 @@ PendingFunding → Open → InProgress → Verifying → Claimed
 - Contract initialization (owner setup)
 
 ## Bugs Found and Fixed
-1. **settle_callback blind spot** — `.then()` chain only captured last FT transfer result. Worker payout could fail silently. Fixed with `.and()` batch + `#[callback_vec]`.
-2. **EVENT_JSON missing** — events logged without NEP-297 `EVENT_JSON:` prefix. Indexers couldn't detect them.
-3. **near_client double-encoding** — `function_call()` already serializes args, passing pre-serialized bytes caused double-encoding.
-4. **get_stats string vs bytes** — `view_call` expects bytes, not Python string.
-5. **Signer init** — `Signer()` expects `KeyPair` object, not raw key string.
+
+### Contract bugs
+
+1. **settle_callback only saw one transfer result (3 iterations)**
+
+   `_settle_escrow()` uses `.and()` to batch FT transfers (e.g. worker payout + owner fee). The `.and()` creates a joint promise with multiple results. The callback must check ALL of them.
+
+   - **v1 bug**: Used `.then()` chain (`transfer1.then(transfer2).then(callback)`). In NEAR, `.then()` callback only receives its immediate predecessor's result. If `transfer1` (worker payout) failed but `transfer2` (fee) succeeded, the callback saw `Ok` from `transfer2` → marked `Claimed`. Worker got nothing, fee was paid.
+   - **v2 bug**: Switched to `.and()` + `#[callback_result]`. But `#[callback_result]` only captures `promise_result(0)` — the first transfer. Same problem in reverse: first transfer succeeds, second fails → callback sees `Ok` from first.
+   - **v3 bug**: Switched to `#[callback_vec]` which panics on any failure. But `verification_callback` writes state (clears `data_id`, sets `settlement_target`) BEFORE calling `_settle_escrow`. If the callback panics, state reverts BUT `verification_callback`'s writes are already committed (different function call). Escrow ends up stuck: status=`Verifying`, data_id=`None`, settlement_target=`Some(Claim)`. No yield to resume (data_id gone), `retry_settlement` only accepted `SettlementFailed`.
+   - **v4 fix (current)**: No annotation on `settle_callback`. Manually iterates `env::promise_results_count()` + `env::promise_result_checked()` to check every result. On any failure → `SettlementFailed` (not panic). `retry_settlement` also accepts `Verifying` with `settlement_target` set as safety net for stuck escrows.
+
+2. **EVENT_JSON prefix missing**
+
+   `emit_event()` logged raw JSON via `env::log_str()`. NEP-297 requires the `EVENT_JSON:` prefix — without it, FastNear, Sharddog, and other indexers ignore the logs entirely. The verifier service wouldn't see any events.
+
+3. **Stale doc comment**: `_settle_escrow` said "Uses Promise::all()" but `Promise::all` doesn't exist in near-sdk 5.x. Uses `.and()`.
+
+### Verifier bugs
+
+4. **near_client double-encoding**: `Account.function_call()` internally does `json.dumps(args)`. Passing pre-serialized bytes caused double-encoding — contract received garbled args like `"{\"data_id_hex\":...}"`  instead of the actual JSON object. Fix: pass a dict, not bytes.
+
+5. **get_stats string vs bytes**: `JsonProvider.view_call()` expects bytes for args. Passed Python `""` instead of `b""` — would crash at runtime with `TypeError` on `base64.b64encode`.
+
+6. **Signer init wrong**: `Signer.__init__` expects `(account_id, KeyPair)`, not `(account_id, str)`. Passing raw `"ed25519:..."` string would crash at runtime. Fix: wrap in `KeyPair(key_str)` first.
+
+7. **Unbounded processed set**: Main loop's `processed` set grew without limit. On long-running verifier, eventual OOM. Fix: cap at 10k entries, evict oldest half when exceeded.
 
 ## Settlement Logic
-- **Passed** (score ≥ threshold): worker gets amount - verifier_fee, owner gets fee
-- **Failed** (score < threshold): agent gets refund - verifier_fee, owner gets fee
-- **Timeout** (~200 blocks): full refund to agent, no verifier fee
-- **SettlementFailed**: callback panic reverts state, admin retries via `retry_settlement()`
-- Storage deposit (1 NEAR) always refunded to agent on final state
+
+Settlement uses `.and()` to batch FT transfers in parallel, then `.then(settle_callback)`. The callback manually checks all promise results.
+
+- **Passed** (score ≥ threshold): worker payout (amount - verifier_fee) + owner fee transfer, batched via `.and()`. All must succeed.
+- **Failed** (score < threshold): agent refund (amount - verifier_fee) + owner fee transfer, batched via `.and()`.
+- **Timeout** (~200 blocks): full refund to agent (single transfer, no verifier fee).
+- **Any FT transfer fails** → `SettlementFailed` status. Owner retries via `retry_settlement()`.
+- **Stuck escrow recovery**: If `verification_callback` partially committed before settlement (data_id cleared, status still Verifying), `retry_settlement` accepts `Verifying` with `settlement_target` set.
+- Storage deposit (1 NEAR) always refunded to agent on final state.
 
 ## Key Design Decisions
+
 - Verifier is OFF-CHAIN LLM service, not WASM
 - yield/resume pattern for async verification (~200 block timeout)
 - Verifier gets paid even on failure (scoring costs compute)
@@ -144,7 +171,8 @@ PendingFunding → Open → InProgress → Verifying → Claimed
 - Two-phase funding prevents stuck FT tokens
 - Score consistency enforced on-chain (can't fake passed with low score)
 - Internal state (data_id, settlement_target) never exposed in views
-- `.and()` + `#[callback_result]` for settlement: failures caught → SettlementFailed → retry_settlement
+- Settlement uses `.and()` for parallel FT transfers + manual `promise_result_checked()` iteration to catch any failure — no `#[callback_result]` or `#[callback_vec]` (both are insufficient for joint promises)
+- `retry_settlement` is the universal recovery path — accepts both `SettlementFailed` and stuck `Verifying` states
 
 ## Dependencies
 - near-sdk 5.6+ (yield/resume API)

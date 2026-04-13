@@ -1,18 +1,24 @@
 # Escrow Agent Marketplace — Project Plan
 
 ## Overview
-Trustless agent-to-agent marketplace. Agents post tasks on Nostr, workers execute them, LLM verifier scores the work. Built on NEAR with yield/resume for async verification.
+Trustless agent-to-agent marketplace. Agents post tasks on Nostr (signed via msig), workers execute them, LLM verifier scores the work. Built on NEAR with yield/resume for async verification.
 
 ## Architecture
 
 ```
-Agent posts task on Nostr (kind:41000)
+Agent signs CreateEscrow action (ed25519 key) → posts to Nostr (kind 41000)
   ↓
-Relayer picks up → create_escrow() on-chain (PendingFunding)
+Relayer picks up → extracts signed action → calls msig.execute()
   ↓
-Agent funds via ft_transfer_call → ft_on_transfer() (Open)
+msig verifies ed25519 sig → calls escrow.create_escrow() (PendingFunding)
   ↓
-Worker sees task (Nostr/FastNear) → claim() (InProgress)
+Agent signs FundEscrow action → posts to Nostr (kind 41003)
+  ↓
+Relayer picks up → calls msig.execute() → msig calls ft_transfer_call()
+  ↓
+Escrow ft_on_transfer() sees sender=msig → Open
+  ↓
+Worker sees task (Nostr) → waits for Open → claims directly on escrow (InProgress)
   ↓
 Worker does job → submit_result() → YIELDS (Verifying)
   ↓
@@ -20,14 +26,23 @@ LLM Verifier scores work → resume_verification(data_id_hex, verdict)
   ↓
 verification_callback → _settle_escrow() → settle_callback()
   ↓
-Worker paid OR agent refunded, verifier fee paid, storage refunded
+Worker paid OR agent refunded (to msig), verifier fee paid, storage refunded
 ```
+
+## Key Architectural Decisions
+
+1. **Two-key model**: Agent has secp256k1 key (Nostr identity) + ed25519 key (msig authorization). No cross-curve derivation — keys stored together in config, binding is operational.
+2. **Relayer is a dumb pipe**: Relayer only extracts signed actions from Nostr events and submits to msig.execute(). Cannot fake, steal, or modify actions.
+3. **Worker goes direct**: Workers claim and submit results directly on the escrow contract. They don't go through msig — only agents do.
+4. **Nostr event kinds**: 41000 (task + CreateEscrow), 41001 (claim), 41002 (result), 41003 (generic actions: fund, cancel, withdraw, rotate).
+5. **Cross-contract failures**: msig increments nonce before dispatching. If escrow call fails, nonce is consumed but funds returned. Agent retries with nonce+1. Event emitted for off-chain monitoring.
+6. **Worker msig deferred to v1+**: Workers use regular NEAR accounts for now.
 
 ## Components
 
 ### 1. NEAR Escrow Contract ✅ (done)
 - Location: `src/lib.rs`
-- Status: Builds clean (zero warnings), 15 unit tests passing
+- Status: Builds clean, 15 unit tests passing
 
 **Features:**
 - Two-phase funding: `create_escrow` (PendingFunding) → `ft_on_transfer` (Open)
@@ -53,7 +68,25 @@ PendingFunding → Open → InProgress → Verifying → Claimed
                                           SettlementFailed → (retry)
 ```
 
-### 2. LLM Verifier Service ✅ (done)
+### 2. Agent Multisig Contract ✅ (done)
+- Location: `agent-msig/src/lib.rs`
+- Status: Builds clean, 16 unit tests passing
+
+**Features:**
+- `execute(action_json, signature)` — verifies ed25519 signature, enforces nonce, dispatches action
+- Actions: CreateEscrow, FundEscrow, CancelEscrow, RegisterToken, RotateKey, Withdraw
+- `ft_on_transfer()` — accepts all incoming FT tokens (returns U128(0))
+- `force_rotate()` — owner emergency key rotation after 7200 block (~24h) cooldown
+- NEP-297 `action_executed` event on every execute() for off-chain observability
+- Views: `get_agent_pubkey`, `get_agent_npub`, `get_nonce`, `get_escrow_contract`, `get_last_action_block`, `get_owner`
+
+**Action JSON format:**
+```json
+{"nonce": 1, "action": {"type": "create_escrow", "job_id": "...", ...}}
+```
+Signed with ed25519 key. Contract parses AFTER signature verification.
+
+### 3. LLM Verifier Service ✅ (done)
 - Location: `verifier/`
 - Status: Complete — main loop, scorer, NEAR client
 
@@ -69,86 +102,25 @@ PendingFunding → Open → InProgress → Verifying → Claimed
 - `NEAR_VERIFIER_KEY` env var (ed25519:base58key) — creates `KeyPair` → `Signer`
 - Default: gemini-2.5-flash, 4 passes, threshold 80, poll interval 3s
 
-### 3. Test Suite ✅ (done)
-- Location: `src/tests.rs`
-- Status: 15 tests, all passing
+### 4. Nostr Integration ✅ (done)
+- Location: `nostr/`
 
-**Coverage:**
-- Contract init
-- create_escrow: happy path + no deposit + duplicate ID + fee too high
-- ft_on_transfer: funding + wrong sender + wrong amount
-- claim: happy path + agent self-claim
-- cancel: happy path + wrong caller
-- Views: stats, storage deposit, list_open empty
+**Files:**
+- `relayer.py` — Watches for kind 41000 (task) and 41003 (generic action) events. Extracts signed actions from Nostr event tags, calls `msig.execute()` on-chain. Does NOT create escrows directly.
+- `worker.py` — Watches for kind 41000 events, filters by capabilities, polls until escrow is Open (handles race condition with relayer), claims on escrow directly, executes task, submits result.
+- `post_task.py` — CLI tool to post kind 41000 events. Agent queries msig nonce, builds CreateEscrow action, signs with ed25519 key, embeds in Nostr event tags.
+- `sign_action.py` — CLI tool to post kind 41003 events for generic actions (fund, cancel, withdraw, rotate, register_token).
+- `event_schema.json` — Event kind definitions (41000-41003) with required/optional tags.
+- `requirements.txt` — Python deps (near-api-py, websockets, PyNaCl, base58, nostr-sdk)
 
-### 4. Nostr Task Discovery ✅ (done)
-- Event schema defined (`nostr/event_schema.json`)
-- Three event kinds:
-  - `41000` — Task posted by agent (tags: job_id, reward, timeout, agent, escrow)
-  - `41001` — Worker claimed task
-  - `41002` — Worker submitted result
-- Content is JSON with `task_description` + `criteria`
-- Tags for filtering: category, skills, priority
+**Two-key model:**
+- `--nostr-key`: secp256k1 private key (hex) for Nostr event signing (identity)
+- `--agent-key`: ed25519 private key (ed25519:base58...) for msig action signing (authorization)
 
-### 5. Relayer ✅ (done)
-- Location: `nostr/relayer.py`
-- WebSocket subscription to task events (kind 41000)
-- Creates on-chain escrow via `create_escrow()` when task detected
-- Attaches 1 NEAR storage deposit
-- Deduplication via processed event cache (10k cap)
-- `--dry-run` mode for watching without creating escrows
-
-### 6. Worker Agent ✅ (done)
-- Location: `nostr/worker.py`
-- Subscribes to task events, filters by capabilities
-- Checks escrow is Open before claiming
-- `claim()` → execute task → `submit_result()` on-chain
-- `_execute_task()` is a placeholder — plug in real agent logic (LLM, code gen, etc.)
-- Capability matching: checks task skills/category against config
-
-### 7. Post Task Helper ✅ (done)
-- Location: `nostr/post_task.py`
-- CLI tool to post kind 41000 events to Nostr
-- Signs with nostr-sdk, sends to configured relays
-
-### 8. Agent Identity 🔲 (TODO)
-- How agents link NEAR account ↔ Nostr keypair
-- Options: Nostr event with NEAR signature, or NEAR social profile with npub
-- Needed so workers can verify who posted the task
-
-### 9. Deploy Scripts 🔲 (TODO)
-- Testnet deployment script (cargo-near deploy)
-- Mainnet deployment script
-- Contract initialization (owner setup)
-
-## Bugs Found and Fixed
-
-### Contract bugs
-
-1. **settle_callback only saw one transfer result (3 iterations)**
-
-   `_settle_escrow()` uses `.and()` to batch FT transfers (e.g. worker payout + owner fee). The `.and()` creates a joint promise with multiple results. The callback must check ALL of them.
-
-   - **v1 bug**: Used `.then()` chain (`transfer1.then(transfer2).then(callback)`). In NEAR, `.then()` callback only receives its immediate predecessor's result. If `transfer1` (worker payout) failed but `transfer2` (fee) succeeded, the callback saw `Ok` from `transfer2` → marked `Claimed`. Worker got nothing, fee was paid.
-   - **v2 bug**: Switched to `.and()` + `#[callback_result]`. But `#[callback_result]` only captures `promise_result(0)` — the first transfer. Same problem in reverse: first transfer succeeds, second fails → callback sees `Ok` from first.
-   - **v3 bug**: Switched to `#[callback_vec]` which panics on any failure. But `verification_callback` writes state (clears `data_id`, sets `settlement_target`) BEFORE calling `_settle_escrow`. If the callback panics, state reverts BUT `verification_callback`'s writes are already committed (different function call). Escrow ends up stuck: status=`Verifying`, data_id=`None`, settlement_target=`Some(Claim)`. No yield to resume (data_id gone), `retry_settlement` only accepted `SettlementFailed`.
-   - **v4 fix (current)**: No annotation on `settle_callback`. Manually iterates `env::promise_results_count()` + `env::promise_result_checked()` to check every result. On any failure → `SettlementFailed` (not panic). `retry_settlement` also accepts `Verifying` with `settlement_target` set as safety net for stuck escrows.
-
-2. **EVENT_JSON prefix missing**
-
-   `emit_event()` logged raw JSON via `env::log_str()`. NEP-297 requires the `EVENT_JSON:` prefix — without it, FastNear, Sharddog, and other indexers ignore the logs entirely. The verifier service wouldn't see any events.
-
-3. **Stale doc comment**: `_settle_escrow` said "Uses Promise::all()" but `Promise::all` doesn't exist in near-sdk 5.x. Uses `.and()`.
-
-### Verifier bugs
-
-4. **near_client double-encoding**: `Account.function_call()` internally does `json.dumps(args)`. Passing pre-serialized bytes caused double-encoding — contract received garbled args like `"{\"data_id_hex\":...}"`  instead of the actual JSON object. Fix: pass a dict, not bytes.
-
-5. **get_stats string vs bytes**: `JsonProvider.view_call()` expects bytes for args. Passed Python `""` instead of `b""` — would crash at runtime with `TypeError` on `base64.b64encode`.
-
-6. **Signer init wrong**: `Signer.__init__` expects `(account_id, KeyPair)`, not `(account_id, str)`. Passing raw `"ed25519:..."` string would crash at runtime. Fix: wrap in `KeyPair(key_str)` first.
-
-7. **Unbounded processed set**: Main loop's `processed` set grew without limit. On long-running verifier, eventual OOM. Fix: cap at 10k entries, evict oldest half when exceeded.
+### 5. Test Suite ✅ (done)
+- Escrow contract: `src/tests.rs` — 15 tests
+- Msig contract: `agent-msig/src/lib.rs` (inline) — 16 tests
+- Total: 31 tests, all passing
 
 ## Settlement Logic
 
@@ -161,32 +133,48 @@ Settlement uses `.and()` to batch FT transfers in parallel, then `.then(settle_c
 - **Stuck escrow recovery**: If `verification_callback` partially committed before settlement (data_id cleared, status still Verifying), `retry_settlement` accepts `Verifying` with `settlement_target` set.
 - Storage deposit (1 NEAR) always refunded to agent on final state.
 
-## Key Design Decisions
+## Bugs Found and Fixed
 
-- Verifier is OFF-CHAIN LLM service, not WASM
-- yield/resume pattern for async verification (~200 block timeout)
-- Verifier gets paid even on failure (scoring costs compute)
-- No verifier allowlist — anyone can call `resume_verification` (off-chain trust model)
-- Relayer/Nostr is just discovery — contract doesn't know about it
-- Two-phase funding prevents stuck FT tokens
-- Score consistency enforced on-chain (can't fake passed with low score)
-- Internal state (data_id, settlement_target) never exposed in views
-- Settlement uses `.and()` for parallel FT transfers + manual `promise_result_checked()` iteration to catch any failure — no `#[callback_result]` or `#[callback_vec]` (both are insufficient for joint promises)
-- `retry_settlement` is the universal recovery path — accepts both `SettlementFailed` and stuck `Verifying` states
+### Escrow contract bugs
 
-## Dependencies
-- near-sdk 5.6+ (yield/resume API)
-- google-genai (Gemini scoring)
-- near-api-py (verifier NEAR RPC)
-- Nostr relays (task discovery — TODO)
-- FastNear RPC (chain queries — verifier polls `list_verifying()` view)
+1. **settle_callback only saw one transfer result (4 iterations)** — Fixed by manually iterating `promise_results_count()` + `promise_result_checked()`. See PLAN.md history for full details.
+
+2. **EVENT_JSON prefix missing** — `emit_event()` logged raw JSON. NEP-297 requires `EVENT_JSON:` prefix.
+
+3. **Stale doc comment**: `_settle_escrow` said "Uses Promise::all()" but uses `.and()`.
+
+### Verifier bugs
+
+4. **near_client double-encoding** — Passed pre-serialized bytes instead of dict.
+5. **get_stats string vs bytes** — Passed Python `""` instead of `b""`.
+6. **Signer init wrong** — Passed raw string instead of `KeyPair(key_str)`.
+7. **Unbounded processed set** — Capped at 10k entries.
+
+### Msig + Nostr bugs (msig-v2 rewrite)
+
+8. **msig arg name mismatch** — `_create_escrow` sent `"token_contract"` / `"description"` but escrow expects `"token"` / `"task_description"`.
+9. **msig ft_on_transfer return type** — Returned `String` instead of `U128` (NEP-141 violation).
+10. **Relayer called escrow directly** — Rewritten to route through `msig.execute()` so `escrow.agent = msig` (correct identity chain).
+11. **Nostr schema missing npub/action/action_sig tags** — Added to event_schema.json.
+12. **No kind 41003 schema** — Added for generic actions.
+
+### Worker bugs (msig-v2 compatibility)
+
+13. **Race condition** — Worker checked escrow before relayer created it. Fixed with polling retry (`_wait_for_open`).
+14. **Config nesting mismatch** — Worker read top-level keys but config has `worker: {...}` section. Fixed to check both.
+15. **max_reward not enforced** — Config had max_reward but never compared against task reward. Fixed.
+16. **skills tag parsing** — Dict approach lost all but last `skills` tag. Fixed with `parse_multi_tags()`.
 
 ## File Structure
 ```
 near-escrow/
 ├── src/
-│   ├── lib.rs           # Contract ✅
+│   ├── lib.rs           # Escrow contract ✅
 │   └── tests.rs         # 15 unit tests ✅
+├── agent-msig/
+│   ├── src/
+│   │   └── lib.rs       # Msig contract + 16 tests ✅
+│   └── Cargo.toml
 ├── verifier/            # LLM verifier service ✅
 │   ├── main.py          # Event loop
 │   ├── scorer.py        # Multi-pass Gemini scoring
@@ -195,10 +183,11 @@ near-escrow/
 │   ├── requirements.txt
 │   └── .gitignore
 ├── nostr/               # Nostr integration ✅
-│   ├── relayer.py       # Nostr → on-chain bridge
+│   ├── relayer.py       # Nostr → msig.execute() bridge
 │   ├── worker.py        # Worker agent (claim + execute + submit)
-│   ├── post_task.py     # CLI tool to post tasks
-│   ├── event_schema.json # Event kind definitions
+│   ├── post_task.py     # CLI: post tasks with signed CreateEscrow
+│   ├── sign_action.py   # CLI: sign/post generic msig actions
+│   ├── event_schema.json # Event kind definitions (41000-41003)
 │   ├── config.example.json
 │   ├── requirements.txt
 │   └── .gitignore
@@ -207,18 +196,27 @@ near-escrow/
 │   └── deploy_mainnet.sh
 ├── Cargo.toml
 ├── PLAN.md
+├── DESIGN-MSIG.md
 └── README.md
 ```
+
+## Dependencies
+- near-sdk 5.6+ (yield/resume API)
+- google-genai (Gemini scoring)
+- near-api-py (NEAR RPC — verifier, relayer, worker)
+- PyNaCl + base58 (ed25519 signing — post_task, sign_action)
+- nostr-sdk (Nostr event creation/posting)
+- websockets (relay subscriptions — relayer, worker)
 
 ## Next Steps
 1. ~~Write verifier service~~ ✅
 2. ~~Write test suite~~ ✅
-3. ~~Fix settlement callback bug~~ ✅ (uses `#[callback_result]`, `SettlementFailed` → `retry_settlement`)
+3. ~~Fix settlement callback bug~~ ✅
 4. ~~Fix EVENT_JSON prefix~~ ✅
-5. ~~Fix pagination (filter before skip)~~ ✅
-6. ~~Add `list_verifying()` view~~ ✅
-7. ~~Update verifier to poll `list_verifying()` instead of block scanning~~ ✅
-8. ~~Build Nostr integration (relayer + worker + post_task + schema)~~ ✅
+5. ~~Build Nostr integration~~ ✅
+6. ~~Build msig contract + Nostr rewrite~~ ✅
+7. ~~Fix worker.py for msig-v2~~ ✅
+8. ~~Update docs (PLAN.md, DESIGN-MSIG.md)~~ ✅
 9. Deploy to testnet (deploy scripts)
 10. End-to-end test on testnet
 11. Deploy to mainnet

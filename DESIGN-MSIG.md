@@ -33,18 +33,19 @@ compromised, agent posts a Nostr event and the contract owner can force-rotate.
 ```rust
 #[near(contract_state)]
 pub struct AgentMsig {
-    agent_pubkey: PublicKey,           // current ed25519 pubkey
-    agent_npub: String,                // agent's Nostr public key (hex) — view only
-    escrow_contract: AccountId,        // the escrow contract to call
-    nonce: u64,                        // replay protection — increments on success
-    owner: AccountId,                  // emergency admin (can force-rotate key)
+    agent_pubkey: Vec<u8>,              // raw ed25519 public key bytes (32 bytes)
+    agent_npub: String,                 // agent's Nostr public key (hex) — view only
+    escrow_contract: AccountId,         // the escrow contract to call
+    nonce: u64,                         // replay protection — increments on success
+    last_action_block: u64,             // block height of last action — for cooldown
+    owner: AccountId,                   // emergency admin (can force-rotate key)
 }
 
 #[near]
 impl AgentMsig {
     // --- Init ---
     #[init]
-    pub fn new(agent_pubkey: PublicKey, agent_npub: String, escrow_contract: AccountId) -> Self;
+    pub fn new(agent_pubkey: String, agent_npub: String, escrow_contract: AccountId) -> Self;
 
     // --- Core ---
     /// Relayer submits a signed action. Contract verifies ed25519 sig, executes.
@@ -55,15 +56,17 @@ impl AgentMsig {
     pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> U128;
 
     // --- Views ---
-    pub fn get_agent_pubkey(&self) -> PublicKey;
+    pub fn get_agent_pubkey(&self) -> String;  // "ed25519:base58..."
     pub fn get_agent_npub(&self) -> String;
     pub fn get_nonce(&self) -> u64;
     pub fn get_escrow_contract(&self) -> AccountId;
+    pub fn get_last_action_block(&self) -> u64;
+    pub fn get_owner(&self) -> AccountId;
 
     // --- Admin ---
     /// Owner force-rotates key (emergency — agent lost both keys).
     /// Can only be called if nonce hasn't changed in N blocks.
-    pub fn force_rotate(&mut self, new_pubkey: PublicKey, new_npub: String);
+    pub fn force_rotate(&mut self, new_pubkey: String, new_npub: String);
 }
 ```
 
@@ -74,7 +77,7 @@ The agent signs JSON, the contract verifies the ed25519 signature against the st
 ```rust
 struct Action {
     nonce: u64,
-    kind: ActionKind,
+    action: ActionKind,
 }
 
 enum ActionKind {
@@ -113,14 +116,14 @@ enum ActionKind {
 **Signature flow:**
 
 ```
-1. Agent builds Action JSON: {"nonce": 5, "kind": {"CreateEscrow": {...}}}
+1. Agent builds Action JSON: {"nonce": 5, "action": {"type": "create_escrow", ...}}
 2. Agent signs action_json.as_bytes() with ed25519 private key
-3. Agent sends (action_json, signature) to relayer
+3. Agent sends (action_json, signature) to relayer (embedded in Nostr event)
 4. Relayer calls msig.execute(action_json, signature)
 5. Contract: env::ed25519_verify(signature, action_json_bytes, stored_pubkey)
 6. Contract: assert action.nonce == self.nonce + 1
 7. Contract: self.nonce = action.nonce
-8. Contract: execute action
+8. Contract: execute action + emit "action_executed" event (NEP-297)
 ```
 
 ## FT Token Handling
@@ -130,7 +133,7 @@ enum ActionKind {
 The msig must register with each FT contract before receiving tokens. Two-step:
 
 ```
-1. Agent signs: { kind: "RegisterToken", token: "usdc.near", nonce: 1 }
+1. Agent signs: {nonce: 1, action: {type: "register_token", token: "usdc.near"}}
 2. msig.execute() → calls storage_deposit on usdc.near (pays from msig NEAR balance)
 3. Now anyone can ft_transfer to the msig
 4. msig.ft_on_transfer() → returns U128(0) (accept all)
@@ -139,7 +142,7 @@ The msig must register with each FT contract before receiving tokens. Two-step:
 **Sending tokens (funding escrow):**
 
 ```
-1. Agent signs: { kind: "FundEscrow", job_id: "job-42", token: "usdc.near", amount: 1000000 }
+1. Agent signs: {nonce: N, action: {type: "fund_escrow", job_id: "job-42", token: "usdc.near", amount: 1000000}}
 2. msig.execute() → calls ft_transfer_call(escrow_contract, amount, job_id) on usdc.near
 3. Escrow's ft_on_transfer sees sender=msig, token=usdc.near, amount matches → Open
 4. escrow.agent = msig account ID (e.g., agent-abc.near)
@@ -168,7 +171,8 @@ This is acceptable because:
 
 ```
 1. Agent generates new ed25519 keypair
-2. Agent signs: { kind: "RotateKey", new_pubkey: "ed25519:new_base58...", nonce: N }
+2. Sign rotation with old key
+   let action_json = json!({nonce: N, action: {type: "rotate_key", new_pubkey: "ed25519:new_base58..."}});
 3. Contract verifies with OLD pubkey, stores new pubkey
 4. Agent updates local config with new key
 ```
@@ -249,14 +253,15 @@ Mitigation:
    - Event posted to Nostr relays
 
 3. CREATE ESCROW
-   - Agent signs action: { kind: "CreateEscrow", ...params, nonce: 1 }
-   - Sends signed action to relayer
-   - Relayer calls msig.execute(action_json, signature)
+   - Agent signs action: {nonce: 1, action: {type: "create_escrow", ...params}}
+   - Embeds signed action in Nostr event (kind 41000) tags: action + action_sig
+   - Relayer extracts signed action, calls msig.execute(action_json, signature)
    - msig verifies sig, calls escrow.create_escrow(), attaches 1 NEAR storage deposit
    - escrow.agent = agent-abc.near (the msig)
 
 4. FUND ESCROW
-   - Agent signs action: { kind: "FundEscrow", job_id, token, amount, nonce: 2 }
+   - Agent signs action: {nonce: 2, action: {type: "fund_escrow", job_id, token, amount}}
+   - Posts as Nostr kind 41003 event
    - Relayer calls msig.execute()
    - msig calls ft_transfer_call(escrow_contract, amount, job_id) on FT contract
    - Escrow receives tokens → status: Open
@@ -269,7 +274,7 @@ Mitigation:
    - msig.ft_on_transfer() accepts tokens back
 
 7. WITHDRAW (if agent wants to move funds out)
-   - Agent signs: { kind: "Withdraw", token: "usdc.near", amount, recipient, nonce: N }
+   - Agent signs: {nonce: N, action: {type: "withdraw", token: "usdc.near", amount, recipient}}
    - msig calls ft_transfer(recipient, amount) or sends NEAR
 ```
 

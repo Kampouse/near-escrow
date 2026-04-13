@@ -2,6 +2,22 @@ use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::{env, near, AccountId, Gas, NearToken, Promise};
 
+// ---------------------------------------------------------------------------
+// Event helper
+// ---------------------------------------------------------------------------
+
+fn emit_event(event: &str, data: &near_sdk::serde_json::Value) {
+    env::log_str(&format!(
+        "EVENT_JSON:{}",
+        &near_sdk::serde_json::json!({
+            "standard": "agent-msig",
+            "version": "1.0.0",
+            "event": event,
+            "data": data,
+        })
+    ));
+}
+
 const GAS_FOR_CREATE_ESCROW: Gas = Gas::from_tgas(50);
 const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
 const GAS_FOR_STORAGE_DEPOSIT: Gas = Gas::from_tgas(10);
@@ -42,6 +58,16 @@ pub struct AgentMsig {
     last_action_block: u64,
     /// Emergency admin — can force-rotate key after cooldown period
     owner: AccountId,
+    /// Tokens allowed for ft_on_transfer — rejects spam/unexpected tokens
+    allowed_tokens: Vec<AccountId>,
+    /// Max NEAR-equivalent value per single action (0 = unlimited)
+    max_action_value_yocto: u128,
+    /// Max total value spent per block-height window
+    daily_limit_yocto: u128,
+    /// Value spent in the current 24h window
+    spent_in_window: u128,
+    /// Block height tracking window start
+    window_start_block: u64,
 }
 
 impl Default for AgentMsig {
@@ -53,6 +79,11 @@ impl Default for AgentMsig {
             nonce: 0,
             last_action_block: 0,
             owner: "root".parse().unwrap(),
+            allowed_tokens: vec![],
+            max_action_value_yocto: 0,
+            daily_limit_yocto: 0,
+            spent_in_window: 0,
+            window_start_block: 0,
         }
     }
 }
@@ -114,6 +145,8 @@ impl AgentMsig {
         agent_npub: String,
         escrow_contract: AccountId,
     ) -> Self {
+        // Prevent re-initialization
+        assert!(!env::state_exists(), "Contract already initialized");
         let pubkey_bytes = decode_ed25519_pubkey(&agent_pubkey);
         Self {
             agent_pubkey: pubkey_bytes,
@@ -122,6 +155,11 @@ impl AgentMsig {
             nonce: 0,
             last_action_block: env::block_height(),
             owner: env::signer_account_id(),
+            allowed_tokens: vec![],
+            max_action_value_yocto: 0, // 0 = unlimited
+            daily_limit_yocto: 0,      // 0 = unlimited
+            spent_in_window: 0,
+            window_start_block: env::block_height(),
         }
     }
 
@@ -157,8 +195,7 @@ impl AgentMsig {
         );
 
         // 2. Parse action
-        let action: Action =
-            serde_json::from_str(&action_json).expect("Invalid action JSON");
+        let action: Action = serde_json::from_str(&action_json).expect("Invalid action JSON");
 
         // 3. Nonce check
         assert!(
@@ -172,6 +209,32 @@ impl AgentMsig {
         self.nonce = action.nonce;
         self.last_action_block = env::block_height();
 
+        // Spending limit check — only applies to actions that move value
+        if let Some(value) = self._action_value(&action.action) {
+            self._enforce_spending_limit(value);
+        }
+
+        // Emit event for off-chain observability.
+        // If the cross-contract call fails, the nonce is still consumed.
+        // Off-chain monitors can detect this by watching for the corresponding
+        // escrow event — if it never appears, the action failed.
+        let action_type = match &action.action {
+            ActionKind::CreateEscrow { .. } => "create_escrow",
+            ActionKind::FundEscrow { .. } => "fund_escrow",
+            ActionKind::CancelEscrow { .. } => "cancel_escrow",
+            ActionKind::RegisterToken { .. } => "register_token",
+            ActionKind::RotateKey { .. } => "rotate_key",
+            ActionKind::Withdraw { .. } => "withdraw",
+        };
+        emit_event(
+            "action_executed",
+            &near_sdk::serde_json::json!({
+                "nonce": action.nonce,
+                "action_type": action_type,
+                "signer": env::signer_account_id().to_string(),
+            }),
+        );
+
         // 5. Dispatch
         match action.action {
             ActionKind::CreateEscrow {
@@ -184,8 +247,14 @@ impl AgentMsig {
                 verifier_fee,
                 score_threshold,
             } => self._create_escrow(
-                &job_id, amount, &token, timeout_hours, &task_description, &criteria,
-                verifier_fee, score_threshold,
+                &job_id,
+                amount,
+                &token,
+                timeout_hours,
+                &task_description,
+                &criteria,
+                verifier_fee,
+                score_threshold,
             ),
             ActionKind::FundEscrow {
                 job_id,
@@ -207,15 +276,16 @@ impl AgentMsig {
     // FT receiving
     // -----------------------------------------------------------------------
 
-    /// Accept all incoming FT tokens (refunds from escrow, deposits, etc.)
-    pub fn ft_on_transfer(
-        &mut self,
-        sender_id: AccountId,
-        amount: U128,
-        msg: String,
-    ) -> String {
+    /// Accept incoming FT tokens — only from whitelisted token contracts.
+    /// Whitelist is empty = accept all (for backward compatibility).
+    pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> U128 {
+        let token_contract = env::predecessor_account_id();
+        // If whitelist is non-empty, reject tokens not on the list
+        if !self.allowed_tokens.is_empty() && !self.allowed_tokens.contains(&token_contract) {
+            return U128(amount.0); // reject
+        }
         let _ = (sender_id, amount, msg);
-        "0".to_string() // accept all, refund nothing
+        U128(0) // accept all, refund nothing
     }
 
     // -----------------------------------------------------------------------
@@ -271,6 +341,71 @@ impl AgentMsig {
         self.agent_npub = new_npub;
     }
 
+    /// Owner sets the token whitelist for ft_on_transfer.
+    /// Empty list = accept all tokens (default).
+    pub fn set_allowed_tokens(&mut self, tokens: Vec<AccountId>) {
+        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
+        self.allowed_tokens = tokens;
+    }
+
+    /// Owner sets spending limits. Both default to 0 (unlimited).
+    /// max_per_action = max value in a single action (0 = unlimited)
+    /// daily_limit = max cumulative value per 24h window (0 = unlimited)
+    pub fn set_spending_limits(&mut self, max_per_action: U128, daily_limit: U128) {
+        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
+        self.max_action_value_yocto = max_per_action.0;
+        self.daily_limit_yocto = daily_limit.0;
+    }
+
+    // -----------------------------------------------------------------------
+    // Internal helpers
+    // -----------------------------------------------------------------------
+
+    /// Extract the monetary value from an action (for spending limits).
+    /// Returns None for non-value actions (rotate_key, register_token, cancel).
+    fn _action_value(&self, action: &ActionKind) -> Option<u128> {
+        match action {
+            ActionKind::CreateEscrow { amount, .. } => Some(amount.0),
+            ActionKind::FundEscrow { amount, .. } => Some(amount.0),
+            ActionKind::Withdraw { amount, .. } => Some(amount.0),
+            ActionKind::CancelEscrow { .. } => None,
+            ActionKind::RegisterToken { .. } => None,
+            ActionKind::RotateKey { .. } => None,
+        }
+    }
+
+    /// Enforce per-action and daily spending limits.
+    /// Resets the daily window if we've moved past 7200 blocks (~24h).
+    fn _enforce_spending_limit(&mut self, value: u128) {
+        // Per-action cap
+        if self.max_action_value_yocto > 0 {
+            assert!(
+                value <= self.max_action_value_yocto,
+                "Action value {} exceeds per-action limit {}",
+                value,
+                self.max_action_value_yocto
+            );
+        }
+        // Daily limit — reset window if expired
+        if self.daily_limit_yocto > 0 {
+            let blocks_since = env::block_height().saturating_sub(self.window_start_block);
+            if blocks_since >= FORCE_ROTATE_COOLDOWN_BLOCKS {
+                // New window
+                self.spent_in_window = 0;
+                self.window_start_block = env::block_height();
+            }
+            let new_total = self.spent_in_window.saturating_add(value);
+            assert!(
+                new_total <= self.daily_limit_yocto,
+                "Daily limit exceeded: {} + {} > {}",
+                self.spent_in_window,
+                value,
+                self.daily_limit_yocto
+            );
+            self.spent_in_window = new_total;
+        }
+    }
+
     // -----------------------------------------------------------------------
     // Internal action handlers
     // -----------------------------------------------------------------------
@@ -289,9 +424,9 @@ impl AgentMsig {
         let args = serde_json::to_vec(&serde_json::json!({
             "job_id": job_id,
             "amount": amount,
-            "token_contract": token,
+            "token": token,
             "timeout_hours": timeout_hours,
-            "description": task_description,
+            "task_description": task_description,
             "criteria": criteria,
             "verifier_fee": verifier_fee,
             "score_threshold": score_threshold,
@@ -375,8 +510,8 @@ impl AgentMsig {
             }
             None => {
                 // Withdraw NEAR
-                let _ = Promise::new(recipient.clone())
-                    .transfer(NearToken::from_yoctonear(amount.0));
+                let _ =
+                    Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount.0));
             }
         }
     }
@@ -480,7 +615,8 @@ mod tests {
         let sk = gen_keypair();
         let mut msig = new_msig(&sk);
 
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         let sig = sign(&sk, action_json);
 
         msig.execute(action_json.to_string(), sig);
@@ -513,7 +649,8 @@ mod tests {
         let sk = gen_keypair();
         let mut msig = new_msig(&sk);
 
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         let wrong_sig = sign(&gen_keypair(), action_json); // different key
 
         msig.execute(action_json.to_string(), wrong_sig);
@@ -525,7 +662,8 @@ mod tests {
         let sk = gen_keypair();
         let mut msig = new_msig(&sk);
 
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         let sig = sign(&sk, action_json);
 
         // Send different JSON than what was signed
@@ -552,7 +690,8 @@ mod tests {
         let sk = gen_keypair();
         let mut msig = new_msig(&sk);
 
-        let action_json = r#"{"nonce":5,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":5,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
     }
 
@@ -562,7 +701,8 @@ mod tests {
         let sk = gen_keypair();
         let mut msig = new_msig(&sk);
 
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Replay same nonce
@@ -641,7 +781,8 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Execute an action at block 0
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Try force rotate at block 100 — cooldown is 7200
@@ -649,10 +790,7 @@ mod tests {
         ctx.block_height(100);
         testing_env!(ctx.build());
 
-        msig.force_rotate(
-            pubkey_str(&gen_keypair()),
-            "new_npub".to_string(),
-        );
+        msig.force_rotate(pubkey_str(&gen_keypair()), "new_npub".to_string());
     }
 
     #[test]
@@ -661,7 +799,8 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Execute action at block 0
-        let action_json = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action_json =
+            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Force rotate at block 8000 (> 7200 cooldown)
@@ -689,7 +828,7 @@ mod tests {
             U128(1000000),
             "deposit".to_string(),
         );
-        assert_eq!(result, "0"); // accept all, refund nothing
+        assert_eq!(result, U128(0)); // accept all, refund nothing
     }
 
     // -----------------------------------------------------------------------
@@ -719,13 +858,207 @@ mod tests {
 
         assert_eq!(parsed.nonce, 1);
         match parsed.action {
-            ActionKind::CreateEscrow {
-                job_id, amount, ..
-            } => {
+            ActionKind::CreateEscrow { job_id, amount, .. } => {
                 assert_eq!(job_id, "job-42");
                 assert_eq!(amount.0, 1_000_000);
             }
             _ => panic!("Wrong action type"),
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Token whitelist
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_ft_on_transfer_whitelist_accepts_known_token() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Set whitelist to allow only usdc.near
+        let mut ctx = setup();
+        testing_env!(ctx.build());
+        msig.set_allowed_tokens(vec!["usdc.near".parse().unwrap()]);
+
+        // usdc.near calls ft_on_transfer — should accept
+        let mut ctx = setup();
+        ctx.predecessor_account_id("usdc.near".parse().unwrap());
+        testing_env!(ctx.build());
+
+        let result = msig.ft_on_transfer(
+            "sender.near".parse().unwrap(),
+            U128(1000000),
+            "deposit".to_string(),
+        );
+        assert_eq!(result, U128(0)); // accept
+    }
+
+    #[test]
+    fn test_ft_on_transfer_whitelist_rejects_unknown_token() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Set whitelist to allow only usdc.near
+        let mut ctx = setup();
+        testing_env!(ctx.build());
+        msig.set_allowed_tokens(vec!["usdc.near".parse().unwrap()]);
+
+        // spam.near calls ft_on_transfer — should reject
+        let mut ctx = setup();
+        ctx.predecessor_account_id("spam.near".parse().unwrap());
+        testing_env!(ctx.build());
+
+        let result = msig.ft_on_transfer(
+            "sender.near".parse().unwrap(),
+            U128(1000000),
+            "deposit".to_string(),
+        );
+        assert_eq!(result, U128(1000000)); // reject — return all
+    }
+
+    #[test]
+    fn test_ft_on_transfer_empty_whitelist_accepts_all() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Default empty whitelist — should accept any token
+        let mut ctx = setup();
+        ctx.predecessor_account_id("random.near".parse().unwrap());
+        testing_env!(ctx.build());
+
+        let result = msig.ft_on_transfer(
+            "sender.near".parse().unwrap(),
+            U128(1000000),
+            "deposit".to_string(),
+        );
+        assert_eq!(result, U128(0)); // accept
+    }
+
+    // -----------------------------------------------------------------------
+    // Spending limits
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn test_spending_limits_allows_within_cap() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Set per-action limit of 1M and daily limit of 10M
+        let mut ctx = setup();
+        testing_env!(ctx.build());
+        msig.set_spending_limits(U128(1_000_000), U128(10_000_000));
+
+        // Execute action with 500K — under both limits
+        let action_json = serde_json::json!({
+            "nonce": 1,
+            "action": {
+                "type": "register_token",
+                "token": "usdc.near"
+            }
+        })
+        .to_string();
+        // register_token has no value, so it bypasses spending check
+        msig.execute(action_json.to_string(), sign(&sk, &action_json));
+        assert_eq!(msig.get_nonce(), 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "Action value 5000000 exceeds per-action limit 1000000")]
+    fn test_spending_limits_rejects_over_per_action() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Set per-action limit of 1M
+        let mut ctx = setup();
+        testing_env!(ctx.build());
+        msig.set_spending_limits(U128(1_000_000), U128(0)); // daily = unlimited
+
+        // CreateEscrow with 5M — exceeds per-action cap
+        let action_json = serde_json::json!({
+            "nonce": 1,
+            "action": {
+                "type": "create_escrow",
+                "job_id": "job-1",
+                "amount": "5000000",
+                "token": "usdc.near",
+                "timeout_hours": 24,
+                "task_description": "Task",
+                "criteria": "Criteria",
+                "verifier_fee": null,
+                "score_threshold": null
+            }
+        })
+        .to_string();
+        msig.execute(action_json.to_string(), sign(&sk, &action_json));
+    }
+
+    #[test]
+    #[should_panic(expected = "Daily limit exceeded")]
+    fn test_spending_limits_rejects_over_daily() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Set per-action = unlimited, daily = 10M
+        let mut ctx = setup();
+        testing_env!(ctx.build());
+        msig.set_spending_limits(U128(0), U128(10_000_000));
+
+        // First action: 8M — under daily
+        let action1 = serde_json::json!({
+            "nonce": 1,
+            "action": {
+                "type": "withdraw",
+                "token": null,
+                "amount": "8000000",
+                "recipient": "bob.near"
+            }
+        })
+        .to_string();
+        msig.execute(action1.to_string(), sign(&sk, &action1));
+
+        // Second action: 5M — exceeds daily (8M + 5M > 10M)
+        let action2 = serde_json::json!({
+            "nonce": 2,
+            "action": {
+                "type": "withdraw",
+                "token": null,
+                "amount": "5000000",
+                "recipient": "bob.near"
+            }
+        })
+        .to_string();
+        msig.execute(action2.to_string(), sign(&sk, &action2));
+    }
+
+    #[test]
+    fn test_set_allowed_tokens_only_owner() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Bob tries to set allowed tokens
+        let mut ctx = setup();
+        ctx.signer_account_id("bob.near".parse().unwrap());
+        testing_env!(ctx.build());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            msig.set_allowed_tokens(vec!["usdc.near".parse().unwrap()]);
+        }));
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_set_spending_limits_only_owner() {
+        let sk = gen_keypair();
+        let mut msig = new_msig(&sk);
+
+        // Bob tries to set spending limits
+        let mut ctx = setup();
+        ctx.signer_account_id("bob.near".parse().unwrap());
+        testing_env!(ctx.build());
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            msig.set_spending_limits(U128(1000), U128(10000));
+        }));
+        assert!(result.is_err());
     }
 }

@@ -90,7 +90,7 @@ class Scorer:
             model=self.model,
             contents=prompt,
             config={
-                "temperature": 0.3 + (pass_num * 0.1),  # Slight variation per pass
+                "temperature": min(0.3 + (pass_num * 0.1), 0.5),  # Cap at 0.5 for consistency
                 "response_mime_type": "application/json",
             },
         )

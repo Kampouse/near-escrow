@@ -1,0 +1,1245 @@
+{
+  "type": "excalidraw",
+  "version": 2,
+  "source": "hermes-agent",
+  "elements": [
+    {
+      "type": "text",
+      "id": "title",
+      "x": 320,
+      "y": 50,
+      "width": 308.0,
+      "height": 32,
+      "text": "ESCROW STATE MACHINE",
+      "fontSize": 28,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "left",
+      "originalText": "ESCROW STATE MACHINE",
+      "autoResize": true
+    },
+    {
+      "type": "text",
+      "id": "subtitle",
+      "x": 400,
+      "y": 90,
+      "width": 220.00000000000003,
+      "height": 20,
+      "text": "near-escrow contract v3.0",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#868e96",
+      "textAlign": "left",
+      "originalText": "near-escrow contract v3.0",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "pending",
+      "x": 500,
+      "y": 150,
+      "width": 200,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_pending",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_pending",
+      "x": 505,
+      "y": 172.0,
+      "width": 190,
+      "height": 24,
+      "text": "PendingFunding",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "pending",
+      "originalText": "PendingFunding",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "cancelled",
+      "x": 200,
+      "y": 150,
+      "width": 180,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#fff3bf",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_cancelled",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_cancelled",
+      "x": 205,
+      "y": 172.0,
+      "width": 170,
+      "height": 24,
+      "text": "Cancelled",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "cancelled",
+      "originalText": "Cancelled",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_cancel",
+      "x": 500,
+      "y": 180,
+      "width": 120,
+      "height": 0,
+      "points": [
+        [
+          -120,
+          0
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "pending",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "cancelled",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_cancel",
+      "x": 401.0,
+      "y": 164.0,
+      "width": 91.0,
+      "height": 18,
+      "text": "cancel(agent)",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "cancel(agent)",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "open",
+      "x": 500,
+      "y": 310,
+      "width": 200,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_open",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_open",
+      "x": 505,
+      "y": 332.0,
+      "width": 190,
+      "height": 24,
+      "text": "Open",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "open",
+      "originalText": "Open",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_fund",
+      "x": 600,
+      "y": 210,
+      "width": 0,
+      "height": 100,
+      "points": [
+        [
+          0,
+          100
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "pending",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "open",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_fund",
+      "x": 558.0,
+      "y": 244.0,
+      "width": 98.0,
+      "height": 18,
+      "text": "ft_on_transfer",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "ft_on_transfer",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "inprog",
+      "x": 500,
+      "y": 470,
+      "width": 200,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_inprog",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_inprog",
+      "x": 505,
+      "y": 492.0,
+      "width": 190,
+      "height": 24,
+      "text": "InProgress",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "inprog",
+      "originalText": "InProgress",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_claim",
+      "x": 600,
+      "y": 370,
+      "width": 0,
+      "height": 100,
+      "points": [
+        [
+          0,
+          100
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "open",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "inprog",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_claim",
+      "x": 525.0,
+      "y": 404.0,
+      "width": 175.0,
+      "height": 18,
+      "text": "claim(worker\n+0.1N stake)",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "claim(worker\n+0.1N stake)",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "verifying",
+      "x": 470,
+      "y": 630,
+      "width": 260,
+      "height": 80,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#d0bfff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_verifying",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_verifying",
+      "x": 475,
+      "y": 663.0,
+      "width": 250,
+      "height": 22,
+      "text": "Verifying\n(yield active ~2min)",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "verifying",
+      "originalText": "Verifying\n(yield active ~2min)",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_submit",
+      "x": 600,
+      "y": 530,
+      "width": 0,
+      "height": 100,
+      "points": [
+        [
+          0,
+          100
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "inprog",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "verifying",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_submit",
+      "x": 561.0,
+      "y": 564.0,
+      "width": 91.0,
+      "height": 18,
+      "text": "submit_result",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "submit_result",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "decision",
+      "x": 460,
+      "y": 790,
+      "width": 280,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#fff3bf",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_decision",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_decision",
+      "x": 465,
+      "y": 813.0,
+      "width": 270,
+      "height": 22,
+      "text": "verification_callback",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "decision",
+      "originalText": "verification_callback",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_yield",
+      "x": 600,
+      "y": 710,
+      "width": 0,
+      "height": 80,
+      "points": [
+        [
+          0,
+          80
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "verifying",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "decision",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "br1",
+      "x": 280,
+      "y": 798,
+      "width": 118.80000000000001,
+      "height": 16,
+      "text": "score >= threshold",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#2b8a3e",
+      "textAlign": "left",
+      "originalText": "score >= threshold",
+      "autoResize": true
+    },
+    {
+      "type": "text",
+      "id": "br2",
+      "x": 280,
+      "y": 814,
+      "width": 112.2,
+      "height": 16,
+      "text": "score < threshold",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#e67700",
+      "textAlign": "left",
+      "originalText": "score < threshold",
+      "autoResize": true
+    },
+    {
+      "type": "text",
+      "id": "br3",
+      "x": 770,
+      "y": 798,
+      "width": 112.2,
+      "height": 16,
+      "text": "malformed/timeout",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#e03131",
+      "textAlign": "left",
+      "originalText": "malformed/timeout",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "settle",
+      "x": 480,
+      "y": 930,
+      "width": 240,
+      "height": 60,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#ffd8a8",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_settle",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_settle",
+      "x": 485,
+      "y": 952.0,
+      "width": 230,
+      "height": 24,
+      "text": "_settle_escrow\n(FT transfers)",
+      "fontSize": 16,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "settle",
+      "originalText": "_settle_escrow\n(FT transfers)",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_settle",
+      "x": 600,
+      "y": 850,
+      "width": 0,
+      "height": 80,
+      "points": [
+        [
+          0,
+          80
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "decision",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "settle",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "rectangle",
+      "id": "failed",
+      "x": 850,
+      "y": 920,
+      "width": 220,
+      "height": 80,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#ffc9c9",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_failed",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_failed",
+      "x": 855,
+      "y": 953.0,
+      "width": 210,
+      "height": 22,
+      "text": "SettlementFailed\nretry anytime",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "failed",
+      "originalText": "SettlementFailed\nretry anytime",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_fail",
+      "x": 720,
+      "y": 960,
+      "width": 130,
+      "height": 0,
+      "points": [
+        [
+          130,
+          0
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "settle",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "failed",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_fail",
+      "x": 761.0,
+      "y": 944.0,
+      "width": 56.0,
+      "height": 18,
+      "text": "FT fails",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "FT fails",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_retry",
+      "x": 850,
+      "y": 990,
+      "width": 130,
+      "height": 60,
+      "points": [
+        [
+          -130,
+          60
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "dashed",
+      "startBinding": {
+        "elementId": "failed",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {}
+    },
+    {
+      "type": "text",
+      "id": "t_a_retry",
+      "x": 737.0,
+      "y": 1004.0,
+      "width": 112.0,
+      "height": 18,
+      "text": "retry_settlement",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "retry_settlement",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "claimed",
+      "x": 320,
+      "y": 1110,
+      "width": 180,
+      "height": 80,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#b2f2bb",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_claimed",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_claimed",
+      "x": 325,
+      "y": 1143.5,
+      "width": 170,
+      "height": 21,
+      "text": "Claimed\n+storage refund\n+stake refund",
+      "fontSize": 13,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "claimed",
+      "originalText": "Claimed\n+storage refund\n+stake refund",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "refunded",
+      "x": 540,
+      "y": 1110,
+      "width": 180,
+      "height": 80,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#b2f2bb",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_refunded",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_refunded",
+      "x": 545,
+      "y": 1143.5,
+      "width": 170,
+      "height": 21,
+      "text": "Refunded\n+storage refund",
+      "fontSize": 13,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "refunded",
+      "originalText": "Refunded\n+storage refund",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "cancelled2",
+      "x": 760,
+      "y": 1110,
+      "width": 180,
+      "height": 80,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#fff3bf",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_cancelled2",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_cancelled2",
+      "x": 765,
+      "y": 1143.5,
+      "width": 170,
+      "height": 21,
+      "text": "Full Refund\nagent gets all FT\nworker stake back",
+      "fontSize": 13,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "cancelled2",
+      "originalText": "Full Refund\nagent gets all FT\nworker stake back",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_claimed",
+      "x": 540,
+      "y": 990,
+      "width": 160,
+      "height": 120,
+      "points": [
+        [
+          -160,
+          120
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "settle",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "claimed",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_claimed",
+      "x": 445.0,
+      "y": 1034.0,
+      "width": 35.0,
+      "height": 18,
+      "text": "Claim",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "Claim",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_refunded",
+      "x": 600,
+      "y": 990,
+      "width": 0,
+      "height": 120,
+      "points": [
+        [
+          0,
+          120
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "settle",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "refunded",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_refunded",
+      "x": 582.0,
+      "y": 1034.0,
+      "width": 42.0,
+      "height": 18,
+      "text": "Refund",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "Refund",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_fullrefund",
+      "x": 660,
+      "y": 990,
+      "width": 160,
+      "height": 120,
+      "points": [
+        [
+          160,
+          120
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "strokeStyle": "solid",
+      "startBinding": {
+        "elementId": "settle",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {
+        "elementId": "cancelled2",
+        "fixedPoint": [
+          0,
+          0.5
+        ]
+      }
+    },
+    {
+      "type": "text",
+      "id": "t_a_fullrefund",
+      "x": 710.0,
+      "y": 1034.0,
+      "width": 70.0,
+      "height": 18,
+      "text": "FullRefund",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "FullRefund",
+      "autoResize": true
+    },
+    {
+      "type": "text",
+      "id": "term",
+      "x": 400,
+      "y": 1210,
+      "width": 315.70000000000005,
+      "height": 18,
+      "text": "TERMINAL STATES (no outgoing transitions)",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#868e96",
+      "textAlign": "left",
+      "originalText": "TERMINAL STATES (no outgoing transitions)",
+      "autoResize": true
+    },
+    {
+      "type": "arrow",
+      "id": "a_exp1",
+      "x": 200,
+      "y": 340,
+      "width": 200,
+      "height": 0,
+      "points": [
+        [
+          200,
+          0
+        ]
+      ],
+      "endArrowhead": "arrow",
+      "strokeColor": "#e67700",
+      "strokeWidth": 2,
+      "strokeStyle": "dashed",
+      "startBinding": {
+        "elementId": "cancelled",
+        "fixedPoint": [
+          1,
+          0.5
+        ]
+      },
+      "endBinding": {}
+    },
+    {
+      "type": "text",
+      "id": "t_a_exp1",
+      "x": 258.0,
+      "y": 324.0,
+      "width": 98.0,
+      "height": 18,
+      "text": "refund_expired",
+      "fontSize": 14,
+      "fontFamily": 1,
+      "strokeColor": "#495057",
+      "textAlign": "center",
+      "originalText": "refund_expired",
+      "autoResize": true
+    },
+    {
+      "type": "text",
+      "id": "leg_title",
+      "x": 320,
+      "y": 1270,
+      "width": 59.400000000000006,
+      "height": 22,
+      "text": "LEGEND",
+      "fontSize": 18,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "left",
+      "originalText": "LEGEND",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "leg1",
+      "x": 320,
+      "y": 1300,
+      "width": 120,
+      "height": 30,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#a5d8ff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_leg1",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_leg1",
+      "x": 325,
+      "y": 1309.0,
+      "width": 110,
+      "height": 20,
+      "text": "Active",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "leg1",
+      "originalText": "Active",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "leg2",
+      "x": 460,
+      "y": 1300,
+      "width": 120,
+      "height": 30,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#d0bfff",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_leg2",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_leg2",
+      "x": 465,
+      "y": 1309.0,
+      "width": 110,
+      "height": 20,
+      "text": "Verifying",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "leg2",
+      "originalText": "Verifying",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "leg3",
+      "x": 600,
+      "y": 1300,
+      "width": 120,
+      "height": 30,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#b2f2bb",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_leg3",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_leg3",
+      "x": 605,
+      "y": 1309.0,
+      "width": 110,
+      "height": 20,
+      "text": "Terminal",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "leg3",
+      "originalText": "Terminal",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "leg4",
+      "x": 740,
+      "y": 1300,
+      "width": 120,
+      "height": 30,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#ffc9c9",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_leg4",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_leg4",
+      "x": 745,
+      "y": 1309.0,
+      "width": 110,
+      "height": 20,
+      "text": "Failed",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "leg4",
+      "originalText": "Failed",
+      "autoResize": true
+    },
+    {
+      "type": "rectangle",
+      "id": "leg5",
+      "x": 880,
+      "y": 1300,
+      "width": 120,
+      "height": 30,
+      "roundness": {
+        "type": 3
+      },
+      "backgroundColor": "#fff3bf",
+      "fillStyle": "solid",
+      "strokeColor": "#1e1e1e",
+      "strokeWidth": 2,
+      "boundElements": [
+        {
+          "id": "t_leg5",
+          "type": "text"
+        }
+      ]
+    },
+    {
+      "type": "text",
+      "id": "t_leg5",
+      "x": 885,
+      "y": 1309.0,
+      "width": 110,
+      "height": 20,
+      "text": "Cancelled",
+      "fontSize": 12,
+      "fontFamily": 1,
+      "strokeColor": "#1e1e1e",
+      "textAlign": "center",
+      "verticalAlign": "middle",
+      "containerId": "leg5",
+      "originalText": "Cancelled",
+      "autoResize": true
+    }
+  ],
+  "appState": {
+    "viewBackgroundColor": "#ffffff"
+  }
+}

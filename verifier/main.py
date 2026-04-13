@@ -16,6 +16,7 @@ import logging
 import os
 import sys
 import time
+from collections import OrderedDict
 from pathlib import Path
 
 from near_client import NearClient
@@ -156,8 +157,8 @@ def main():
     log.info("Model: %s, passes: %d", scorer.model, scorer.passes)
 
     # Track processed job IDs to avoid re-processing
-    # Bounded: trim oldest when exceeding 10k entries
-    processed: set[str] = set()
+    # Ordered for FIFO eviction
+    processed: OrderedDict[str, bool] = OrderedDict()
     MAX_PROCESSED = 10_000
 
     while True:
@@ -188,12 +189,10 @@ def main():
                 success = process_verifying_escrow(job_id, data_id, near, scorer)
 
                 if success:
-                    processed.add(job_id)
-                    if len(processed) > MAX_PROCESSED:
-                        # Evict oldest half
-                        evict_count = len(processed) // 2
-                        for _ in range(evict_count):
-                            processed.discard(next(iter(processed)))
+                    processed[job_id] = True
+                    # FIFO eviction — pop oldest entries
+                    while len(processed) > MAX_PROCESSED:
+                        processed.popitem(last=False)
 
             if args.once:
                 break

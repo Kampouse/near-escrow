@@ -9,8 +9,11 @@
     ["job_id",     "<unique-id> — must match escrow contract job_id"],
     ["reward",     "<amount>", "<token-contract-account-id>"],
     ["timeout",    "<hours>"],
-    ["agent",      "<near-account-id>"],
-    ["escrow",     "<escrow-contract-account-id>"]
+    ["agent",      "<msig-contract-address>"],
+    ["escrow",     "<escrow-contract-account-id>"],
+    ["npub",       "<nostr-pubkey-hex>"],
+    ["action",     "<json-string — signed Action object (CreateEscrow)"],
+    ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
   ],
 
   "optional_tags": [
@@ -37,8 +40,11 @@
       ["job_id", "task-2024-0412-001"],
       ["reward", "5000000", "usdt.tether-token.near"],
       ["timeout", "48"],
-      ["agent", "kampouse.near"],
+      ["agent", "agent-abc.near"],
       ["escrow", "escrow.kampouse.near"],
+      ["npub", "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca"],
+      ["action", "{\"action\":{\"amount\":\"5000000\",\"criteria\":\"Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js.\",\"job_id\":\"task-2024-0412-001\",\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"timeout_hours\":48,\"token\":\"usdt.tether-token.near\",\"type\":\"create_escrow\"},\"nonce\":1}"],
+      ["action_sig", "a1b2c3...64-byte-hex-signature"],
       ["verifier_fee", "500000"],
       ["score_threshold", "80"],
       ["category", "coding"],
@@ -60,6 +66,15 @@
     ["worker", "<near-account-id>"],
     ["escrow", "<escrow-contract-id>"]
   ],
+
+  "event_kind_action": 41003,
+  "action_event_description": "Generic signed action relayed through msig. Used for fund_escrow, cancel_escrow, register_token, rotate_key, withdraw.",
+  "action_event_tags": [
+    ["agent",      "<msig-contract-address>"],
+    ["action",     "<json-string — the full Action object signed by agent>"],
+    ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
+  ],
+  "action_content_example": "",
   "result_content_example": {
     "summary": "Completed REST API with all endpoints, tests passing at 94% coverage",
     "artifacts": ["https://github.com/worker/repo/pull/1"],

@@ -11,6 +11,7 @@
 
   "worker": {
     "worker_account_id": "worker.testnet",
+    "nostr_key": null,
     "capabilities": ["coding", "typescript", "python", "rest-api", "research"],
     "max_reward": "10000000"
   },
@@ -18,7 +19,8 @@
   "nostr_event_kinds": {
     "task": 41000,
     "claim": 41001,
-    "result": 41002
+    "result": 41002,
+    "action": 41003
   },
 
   "poll_interval_seconds": 3,

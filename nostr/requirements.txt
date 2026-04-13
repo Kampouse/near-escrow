@@ -1,3 +1,10 @@
+# Nostr integration dependencies
+# Core (required)
+near-api-py>=1.0.0
 websockets>=12.0
-near-api-py>=0.1.0
+PyNaCl>=1.5.0
+base58>=2.1.0
+
+# Nostr SDK (optional — for post_task.py and sign_action.py)
+# Provides event building, signing, and relay communication
 nostr-sdk>=0.1.0

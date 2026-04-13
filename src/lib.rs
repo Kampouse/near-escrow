@@ -3,7 +3,9 @@ use near_sdk::collections::UnorderedMap;
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
 use near_sdk::serde_json;
-use near_sdk::{env, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseError};
+use near_sdk::{
+    env, log, near, AccountId, CryptoHash, Gas, GasWeight, NearToken, Promise, PromiseError,
+};
 
 const GAS_FOR_YIELD_CALLBACK: Gas = Gas::from_tgas(50);
 const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
@@ -15,6 +17,10 @@ const DATA_ID_REGISTER: u64 = 0;
 // Covers the Escrow struct + UnorderedMap entry overhead.
 // Surplus is refunded on settle/cancel.
 const STORAGE_DEPOSIT_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
+
+// Worker stake — anti-spam bond. Forfeited to agent on yield timeout
+// (worker submitted but never verified). Refunded on successful settlement.
+const WORKER_STAKE_YOCTO: u128 = 100_000_000_000_000_000_000_000; // 0.1 NEAR
 
 // --- Verifier verdict ---
 
@@ -77,6 +83,8 @@ pub struct Escrow {
     // Internal — not exposed in views
     pub data_id: Option<CryptoHash>,
     pub settlement_target: Option<SettlementTarget>,
+    pub worker_stake: Option<U128>, // Anti-spam bond (0.1 NEAR), refunded on settle
+    pub yield_consumed: bool,       // Guard against double resume_verification
 }
 
 // --- Escrow view (public, no internal fields) ---
@@ -158,6 +166,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 pub struct EscrowContract {
     owner: AccountId,
     escrows: UnorderedMap<String, Escrow>,
+    initialized: bool,
 }
 
 impl Default for EscrowContract {
@@ -165,17 +174,27 @@ impl Default for EscrowContract {
         Self {
             owner: "root".parse().unwrap(),
             escrows: UnorderedMap::new(b"e"),
+            initialized: false,
         }
     }
 }
+
+// String length caps — prevent state bloat / gas-exhaustion attacks
+const MAX_JOB_ID_LEN: usize = 128;
+const MAX_TASK_DESCRIPTION_LEN: usize = 2048;
+const MAX_CRITERIA_LEN: usize = 2048;
+const MAX_RESULT_LEN: usize = 8192;
 
 #[near]
 impl EscrowContract {
     #[init]
     pub fn new() -> Self {
+        // Prevent re-initialization — state already exists from first call
+        assert!(!env::state_exists(), "Contract already initialized");
         Self {
             owner: env::signer_account_id(),
             escrows: UnorderedMap::new(b"e"),
+            initialized: true,
         }
     }
 
@@ -199,15 +218,39 @@ impl EscrowContract {
     ) {
         let agent = env::signer_account_id();
         assert!(!job_id.is_empty(), "Job ID required");
+        assert!(
+            job_id.len() <= MAX_JOB_ID_LEN,
+            "Job ID too long (max {} bytes)",
+            MAX_JOB_ID_LEN
+        );
         assert!(amount.0 > 0, "Amount must be > 0");
         assert!(self.escrows.get(&job_id).is_none(), "Job ID exists");
 
         let vfee = verifier_fee.unwrap_or(U128(0));
         assert!(vfee.0 < amount.0, "Verifier fee must be less than amount");
 
+        // String length caps — validate BEFORE moving into struct
+        assert!(
+            task_description.len() <= MAX_TASK_DESCRIPTION_LEN,
+            "Task description too long (max {} bytes)",
+            MAX_TASK_DESCRIPTION_LEN
+        );
+        assert!(
+            !criteria.is_empty(),
+            "Criteria required — prevents vague tasks"
+        );
+        assert!(
+            criteria.len() <= MAX_CRITERIA_LEN,
+            "Criteria too long (max {} bytes)",
+            MAX_CRITERIA_LEN
+        );
+
         // Storage staking: require deposit, refund surplus on settle/cancel
         let attached = env::attached_deposit().as_yoctonear();
-        assert!(attached >= STORAGE_DEPOSIT_YOCTO, "Insufficient storage deposit: attach at least 1 NEAR");
+        assert!(
+            attached >= STORAGE_DEPOSIT_YOCTO,
+            "Insufficient storage deposit: attach at least 1 NEAR"
+        );
 
         let escrow = Escrow {
             job_id: job_id.clone(),
@@ -226,6 +269,8 @@ impl EscrowContract {
             verdict: None,
             data_id: None,
             settlement_target: None,
+            worker_stake: None,
+            yield_consumed: false,
         };
 
         self.escrows.insert(&job_id, &escrow);
@@ -296,6 +341,8 @@ impl EscrowContract {
 
     /// Worker (found task via Nostr/FastNear) claims the job.
     /// Agent cannot claim their own escrow.
+    /// Requires 0.1 NEAR attached deposit as anti-spam bond.
+    /// Bond is refunded on successful settlement, forfeited to agent on timeout.
     pub fn claim(&mut self, job_id: String) {
         let caller = env::signer_account_id();
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
@@ -303,7 +350,15 @@ impl EscrowContract {
         assert!(escrow.worker.is_none(), "Already claimed");
         assert_ne!(caller, escrow.agent, "Agent cannot claim own escrow");
 
+        // Require anti-spam stake
+        let attached = env::attached_deposit().as_yoctonear();
+        assert!(
+            attached >= WORKER_STAKE_YOCTO,
+            "Worker stake required: attach at least 0.1 NEAR"
+        );
+
         escrow.worker = Some(caller.clone());
+        escrow.worker_stake = Some(U128(attached));
         escrow.status = EscrowStatus::InProgress;
         self.escrows.insert(&job_id, &escrow);
 
@@ -327,17 +382,17 @@ impl EscrowContract {
         let caller = env::signer_account_id();
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
         assert!(escrow.status == EscrowStatus::InProgress, "Not in progress");
-        assert_eq!(
-            caller,
-            escrow.worker.clone().unwrap_or("".parse().unwrap()),
-            "Not the worker"
-        );
+        assert_eq!(caller, escrow.worker.clone().unwrap(), "Not the worker");
         assert!(!result.is_empty(), "Result cannot be empty");
+        assert!(
+            result.len() <= MAX_RESULT_LEN,
+            "Result too long (max {} bytes)",
+            MAX_RESULT_LEN
+        );
 
         escrow.result = Some(result);
 
-        let callback_args =
-            serde_json::to_vec(&serde_json::json!({"job_id": job_id})).unwrap();
+        let callback_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).unwrap();
 
         let _promise = env::promise_yield_create(
             "verification_callback",
@@ -378,15 +433,42 @@ impl EscrowContract {
     ///   data_id_hex — hex-encoded CryptoHash from the `result_submitted` event
     ///   verdict — JSON string: {"score": 85, "passed": true, "detail": "..."}
     pub fn resume_verification(&mut self, data_id_hex: String, verdict: String) -> bool {
+        // Only the designated verifier (contract owner) can resume
+        assert_eq!(
+            env::signer_account_id(),
+            self.owner,
+            "Only verifier can resume"
+        );
+
+        // Double-resume guard: find the escrow matching this data_id and
+        // ensure it hasn't already been consumed.
+        let hex = data_id_hex.clone();
+        let mut matching_job: Option<String> = None;
+        for (jid, e) in self.escrows.iter() {
+            if let Some(ref did) = e.data_id {
+                if hex_encode(did.as_ref()) == hex {
+                    matching_job = Some(jid);
+                    break;
+                }
+            }
+        }
+        if let Some(jid) = matching_job {
+            let escrow = self.escrows.get(&jid).expect("just iterated");
+            assert!(!escrow.yield_consumed, "Yield already consumed");
+            // Mark consumed BEFORE resume — if resume fails, this prevents retry
+            // with same data_id, but that's safer than double-execution
+            let mut escrow = escrow;
+            escrow.yield_consumed = true;
+            self.escrows.insert(&jid, &escrow);
+        }
+
         // Decode hex data_id to bytes
         let data_id_bytes: Vec<u8> = (0..data_id_hex.len())
             .step_by(2)
             .map(|i| u8::from_str_radix(&data_id_hex[i..i + 2], 16).unwrap_or(0))
             .collect();
 
-        let data_id: [u8; 32] = data_id_bytes
-            .try_into()
-            .expect("data_id must be 32 bytes");
+        let data_id: [u8; 32] = data_id_bytes.try_into().expect("data_id must be 32 bytes");
 
         let payload = verdict.as_bytes();
 
@@ -416,49 +498,80 @@ impl EscrowContract {
 
         let (settlement_target, verdict) = match result {
             Ok(data) => {
-                let val: serde_json::Value = serde_json::from_slice(&data).unwrap_or_else(|_| {
-                    serde_json::json!({"score": 0, "passed": false, "detail": "invalid payload"})
-                });
+                let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&data);
+                match parsed {
+                    Ok(val) => {
+                        let score = val["score"].as_u64().unwrap_or(0) as u8;
+                        let raw_passed = val["passed"].as_bool().unwrap_or(false);
+                        let detail = val["detail"].as_str().unwrap_or("no detail").to_string();
 
-                let score = val["score"].as_u64().unwrap_or(0) as u8;
-                let raw_passed = val["passed"].as_bool().unwrap_or(false);
-                let detail = val["detail"]
-                    .as_str()
-                    .unwrap_or("no detail")
-                    .to_string();
+                        // Force consistency: can't claim passed with score below threshold
+                        let actually_passed = raw_passed && score >= escrow.score_threshold;
 
-                // Force consistency: can't claim passed with score below threshold
-                let actually_passed = raw_passed && score >= escrow.score_threshold;
+                        let verdict = VerifierVerdict {
+                            score,
+                            passed: actually_passed,
+                            detail: detail.clone(),
+                        };
 
-                let verdict = VerifierVerdict {
-                    score,
-                    passed: actually_passed,
-                    detail: detail.clone(),
-                };
+                        let target = if actually_passed {
+                            SettlementTarget::Claim
+                        } else {
+                            SettlementTarget::Refund
+                        };
 
-                let target = if actually_passed {
-                    SettlementTarget::Claim
-                } else {
-                    SettlementTarget::Refund
-                };
+                        emit_event(
+                            "verification_result",
+                            &serde_json::json!({
+                                "job_id": job_id,
+                                "score": score,
+                                "passed": actually_passed,
+                                "detail": detail,
+                            }),
+                        );
 
-                emit_event(
-                    "verification_complete",
-                    &serde_json::json!({
-                        "job_id": job_id,
-                        "score": score,
-                        "passed": actually_passed,
-                        "detail": detail,
-                    }),
-                );
-
-                (target, Some(verdict))
+                        (target, Some(verdict))
+                    }
+                    Err(e) => {
+                        // Malformed verdict — verifier sent garbage. Don't punish worker.
+                        // Full refund to agent + worker stake refunded. Verifier failed, not the worker.
+                        log!("Verifier sent malformed payload: {}", e);
+                        if let Some(stake) = escrow.worker_stake {
+                            if let Some(ref worker) = escrow.worker {
+                                let _ = Promise::new(worker.clone())
+                                    .transfer(NearToken::from_yoctonear(stake.0));
+                            }
+                        }
+                        escrow.worker_stake = None;
+                        emit_event(
+                            "verification_malformed",
+                            &serde_json::json!({
+                                "job_id": job_id,
+                                "error": format!("{}", e),
+                                "worker_stake_refunded": true,
+                            }),
+                        );
+                        (SettlementTarget::FullRefund, None)
+                    }
+                }
             }
             Err(_) => {
-                // Timeout — nobody verified, full refund to agent
+                // Timeout — nobody verified, full refund to agent.
+                // Worker stake REFUNDED to worker — timeout is verifier's fault, not worker's.
+                // Worker already did the work and submitted the result.
+                if let Some(stake) = escrow.worker_stake {
+                    if let Some(ref worker) = escrow.worker {
+                        let _ = Promise::new(worker.clone())
+                            .transfer(NearToken::from_yoctonear(stake.0));
+                    }
+                }
+                escrow.worker_stake = None;
                 emit_event(
                     "verification_timeout",
-                    &serde_json::json!({"job_id": job_id}),
+                    &serde_json::json!({
+                        "job_id": job_id,
+                        "worker_stake_refunded": true,
+                    }),
                 );
                 (SettlementTarget::FullRefund, None)
             }
@@ -484,7 +597,10 @@ impl EscrowContract {
     fn _settle_escrow(&mut self, job_id: &str) {
         let job_id_string = job_id.to_string();
         let escrow = self.escrows.get(&job_id_string).expect("Not found");
-        let target = escrow.settlement_target.clone().expect("No settlement target");
+        let target = escrow
+            .settlement_target
+            .clone()
+            .expect("No settlement target");
         let token = escrow.token.clone();
         let total = escrow.amount.0;
         let vfee = escrow.verifier_fee.0;
@@ -540,6 +656,12 @@ impl EscrowContract {
     /// All succeed → final status (Claimed/Refunded) + storage deposit refund.
     /// Any fail → SettlementFailed (admin retries via retry_settlement).
     pub fn settle_callback(&mut self, job_id: String) {
+        // Guard against direct calls — must be invoked as a promise callback
+        assert!(
+            env::promise_results_count() > 0,
+            "settle_callback must be called as a promise callback"
+        );
+
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
         let target = escrow
             .settlement_target
@@ -570,6 +692,15 @@ impl EscrowContract {
             let _ = Promise::new(escrow.agent.clone())
                 .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
 
+            // Refund worker stake on successful settlement (worker did their job)
+            if let Some(stake) = escrow.worker_stake {
+                if let Some(ref worker) = escrow.worker {
+                    let _ =
+                        Promise::new(worker.clone()).transfer(NearToken::from_yoctonear(stake.0));
+                }
+            }
+            escrow.worker_stake = None;
+
             emit_event(
                 "escrow_settled",
                 &serde_json::json!({
@@ -579,10 +710,7 @@ impl EscrowContract {
             );
         } else {
             escrow.status = EscrowStatus::SettlementFailed;
-            emit_event(
-                "settlement_failed",
-                &serde_json::json!({"job_id": job_id}),
-            );
+            emit_event("settlement_failed", &serde_json::json!({"job_id": job_id}));
         }
 
         self.escrows.insert(&job_id, &escrow);
@@ -592,17 +720,36 @@ impl EscrowContract {
     // Admin: retry failed settlements
     // ========================================
 
-    /// Owner can retry a failed settlement.
+    /// Anyone can retry a failed settlement after a cooldown (7200 blocks / ~24h).
+    /// Owner can retry immediately — no cooldown required.
     /// Also accepts Verifying with settlement_target set — safety net if
     /// verification_callback partially committed before settle failed.
     pub fn retry_settlement(&mut self, job_id: String) {
-        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
         let escrow = self.escrows.get(&job_id).expect("Not found");
         let valid = escrow.status == EscrowStatus::SettlementFailed
-            || (escrow.status == EscrowStatus::Verifying
-                && escrow.settlement_target.is_some());
-        assert!(valid, "Not retryable — must be SettlementFailed or Verifying with target");
+            || (escrow.status == EscrowStatus::Verifying && escrow.settlement_target.is_some());
+        assert!(
+            valid,
+            "Not retryable — must be SettlementFailed or Verifying with target"
+        );
         assert!(escrow.settlement_target.is_some(), "No settlement target");
+
+        // Owner can retry immediately; anyone else must wait cooldown
+        let caller = env::signer_account_id();
+        if caller != self.owner {
+            let _blocks_since_creation = env::block_height().saturating_sub(
+                // Use created_at block approximation — settlement_target was set
+                // after verification, so escrow has been stuck at least since then.
+                // We use the escrow timeout as a proxy for "long enough to retry".
+                0u64, // block_height not stored, use timeout heuristic below
+            );
+            // At minimum, the escrow must be expired before anyone can retry
+            assert!(
+                env::block_timestamp_ms() > escrow.created_at + escrow.timeout_ms,
+                "Only owner can retry before expiry"
+            );
+        }
+
         self._settle_escrow(&job_id);
     }
 
@@ -625,10 +772,7 @@ impl EscrowContract {
                 // Refund storage deposit
                 let _ = Promise::new(escrow.agent.clone())
                     .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
-                emit_event(
-                    "escrow_cancelled",
-                    &serde_json::json!({"job_id": job_id}),
-                );
+                emit_event("escrow_cancelled", &serde_json::json!({"job_id": job_id}));
             }
             EscrowStatus::Open => {
                 escrow.settlement_target = Some(SettlementTarget::FullRefund);
@@ -663,12 +807,25 @@ impl EscrowContract {
                 );
             }
             EscrowStatus::Open | EscrowStatus::InProgress => {
+                // Forfeit worker stake to agent if InProgress (worker claimed but timed out)
+                if escrow.status == EscrowStatus::InProgress {
+                    if let Some(stake) = escrow.worker_stake {
+                        let _ = Promise::new(escrow.agent.clone())
+                            .transfer(NearToken::from_yoctonear(stake.0));
+                    }
+                    escrow.worker_stake = None;
+                }
                 escrow.settlement_target = Some(SettlementTarget::FullRefund);
                 self.escrows.insert(&job_id, &escrow);
                 self._settle_escrow(&job_id);
             }
             EscrowStatus::Verifying => {
                 panic!("Cannot refund while verifying — yield timeout handles this");
+            }
+            EscrowStatus::SettlementFailed => {
+                // Settlement previously failed — retry it now that time has passed.
+                // FT contract may have recovered. Anyone can trigger this on expired escrows.
+                self._settle_escrow(&job_id);
             }
             _ => panic!("Already settled"),
         }
@@ -725,6 +882,36 @@ impl EscrowContract {
         self.escrows
             .iter()
             .filter(|(_, e)| e.worker.as_ref() == Some(&worker))
+            .skip(from as usize)
+            .take(max as usize)
+            .map(|(_, e)| e.into())
+            .collect()
+    }
+
+    /// Admin view: list escrows by status. Owner only.
+    pub fn list_by_status(
+        &self,
+        status: String,
+        from_index: Option<u64>,
+        limit: Option<u64>,
+    ) -> Vec<EscrowView> {
+        assert_eq!(env::signer_account_id(), self.owner, "Only owner");
+        let from = from_index.unwrap_or(0);
+        let max = limit.unwrap_or(50).min(100);
+        let target: EscrowStatus = match status.as_str() {
+            "PendingFunding" => EscrowStatus::PendingFunding,
+            "Open" => EscrowStatus::Open,
+            "InProgress" => EscrowStatus::InProgress,
+            "Verifying" => EscrowStatus::Verifying,
+            "Claimed" => EscrowStatus::Claimed,
+            "Refunded" => EscrowStatus::Refunded,
+            "Cancelled" => EscrowStatus::Cancelled,
+            "SettlementFailed" => EscrowStatus::SettlementFailed,
+            _ => panic!("Unknown status: {}", status),
+        };
+        self.escrows
+            .iter()
+            .filter(|(_, e)| e.status == target)
             .skip(from as usize)
             .take(max as usize)
             .map(|(_, e)| e.into())

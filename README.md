@@ -124,6 +124,129 @@ The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain exe
 
 Legacy kinds (7200-7205) supported for backwards compatibility.
 
+## Nostr ↔ Contract Flow
+
+Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them.
+
+```
+AGENT                          NOSTR                          DAEMON                         NEAR ON-CHAIN
+  │                              │                              │                               │
+  │  1. Sign CreateEscrow        │                              │                               │
+  │     + FundEscrow with        │                              │                               │
+  │     ed25519 key              │                              │                               │
+  │                              │                              │                               │
+  │  2. POST kind 41000 ────────►│                              │                               │
+  │     tags: action, action_sig,│                              │                               │
+  │     fund_action,             │                              │                               │
+  │     fund_action_sig,         │                              │                               │
+  │     agent (msig address),    │                              │                               │
+  │     description, reward      │                              │                               │
+  │                              │  3. Relayer thread ─────────►│                               │
+  │                              │     subscribes to 41000      │                               │
+  │                              │                              │                               │
+  │                              │                              │  4. Extract signed actions    │
+  │                              │                              │     + msig address from tags  │
+  │                              │                              │                               │
+  │                              │                              │  5. msig.execute() ──────────►│
+  │                              │                              │     (action_json + sig)       │
+  │                              │                              │                               │
+  │                              │                              │                    ┌──────────┤
+  │                              │                              │                    │ msig     │
+  │                              │                              │                    │ verifies │
+  │                              │                              │                    │ sig+nonce│
+  │                              │                              │                    └────┬─────┤
+  │                              │                              │                         │     │
+  │                              │                              │         create_escrow() ├────►│ PendingFunding
+  │                              │                              │         fund_escrow()   ├────►│ Open
+  │                              │                              │                               │
+  │                              │  6. Worker thread ──────────►│                               │
+  │                              │     sees same 41000          │                               │
+  │                              │                              │                               │
+  │                              │                              │  7. poll_until_open() ───────►│
+  │                              │                              │     (retries until funded)    │
+  │                              │                              │                               │
+  │                              │                              │  8. claim() ─────────────────►│ InProgress
+  │                              │                              │     (stake deposit)           │
+  │                              │                              │                               │
+  │                              │  9. POST kind 41001 ◄───────│                               │
+  │                              │     (claim notification)     │                               │
+  │                              │                              │                               │
+  │                              │                              │  10. Execute WASM task        │
+  │                              │                              │      (local compute)          │
+  │                              │                              │                               │
+  │                              │                              │  11. Write result to          │
+  │                              │                              │      FastNear KV via RPC ────►│ KV stored
+  │                              │                              │                               │
+  │                              │                              │  12. submit_result() ────────►│ Verifying
+  │                              │                              │      {kv_account, kv_key}     │ (YIELDS)
+  │                              │                              │                               │
+  │                              │  13. POST kind 41002 ◄──────│                               │
+  │                              │     (result notification)    │                               │
+  │                              │                              │                               │
+  │                              │                              │  ─── ~200 block timeout ──── │
+  │                              │                              │                               │
+  │                              │                              │  14. Verifier thread          │
+  │                              │                              │      polls list_verifying() ─►│
+  │                              │                              │                               │
+  │                              │                              │  15. Fetch result from        │
+  │                              │                              │      FastNear KV (HTTP GET)   │
+  │                              │                              │                               │
+  │                              │                              │  16. Score via Gemini API     │
+  │                              │                              │      (4 passes, median)       │
+  │                              │                              │                               │
+  │                              │                              │  17. resume_verification() ──►│
+  │                              │                              │      {score, passed}          │
+  │                              │                              │                               │
+  │                              │                              │                    ┌──────────┤
+  │                              │                              │                    │ contract │
+  │                              │                              │                    │ resumes  │
+  │                              │                              │                    │ yield    │
+  │                              │                              │                    └────┬─────┤
+  │                              │                              │                         │     │
+  │                              │                              │       settlement_callback├────►│
+  │                              │                              │                         │     │
+  │                              │                              │       ft_transfer(worker)├───►│ worker paid
+  │                              │                              │       ft_transfer(verifier)├──►│ verifier fee
+  │                              │                              │                               │
+  │                              │  18. POST kind 41005 ◄──────│                               │
+  │                              │     (settlement confirmed)   │                               │
+  │                              │                              │                               │
+  │  19. See 41005 ◄────────────│                              │                               │
+  │     (agent notified)         │                              │                               │
+```
+
+### Event Tags Reference
+
+**Kind 41000 (TASK):**
+```json
+{
+  "kind": 41000,
+  "content": "Summarize this article about NEAR Protocol",
+  "tags": [
+    ["action", "{\"CreateEscrow\":{...}}"],
+    ["action_sig", "<64-byte hex ed25519 signature>"],
+    ["fund_action", "{\"FundEscrow\":{\"job_id\":\"task-001\",\"amount\":\"1000000\"}}"],
+    ["fund_action_sig", "<64-byte hex ed25519 signature>"],
+    ["agent", "<msig_account_id>"],
+    ["description", "Summarize this article"],
+    ["reward", "1 USDC"]
+  ]
+}
+```
+
+**Kind 41003 (ACTION) — cancel, withdraw, rotate:**
+```json
+{
+  "kind": 41003,
+  "content": "",
+  "tags": [
+    ["action", "{\"CancelEscrow\":{\"job_id\":\"task-001\"}}"],
+    ["action_sig", "<64-byte hex>"],
+    ["agent", "<msig_account_id>"]
+  ]
+}
+```
+
 ## Escrow Flow
 
 ```

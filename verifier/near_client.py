@@ -115,7 +115,7 @@ class NearClient:
         result = self.provider.view_call(
             self.contract_id,
             "get_stats",
-            "",
+            b"",
         )
         if result.get("result"):
             return json.loads(bytes(result["result"]).decode())

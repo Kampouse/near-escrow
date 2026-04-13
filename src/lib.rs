@@ -11,7 +11,7 @@ const GAS_FOR_SETTLE_CALLBACK: Gas = Gas::from_tgas(10);
 const ONE_YOCTO: NearToken = NearToken::from_yoctonear(1);
 const DATA_ID_REGISTER: u64 = 0;
 
-// Storage deposit per escrow (100 NEAR * 10^24 yocto = generous overestimate).
+// Storage deposit per escrow — generous overestimate.
 // Covers the Escrow struct + UnorderedMap entry overhead.
 // Surplus is refunded on settle/cancel.
 const STORAGE_DEPOSIT_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
@@ -124,15 +124,15 @@ impl From<Escrow> for EscrowView {
 // --- Helpers ---
 
 fn emit_event(event: &str, data: &serde_json::Value) {
-    env::log_str(
+    env::log_str(&format!(
+        "EVENT_JSON:{}",
         &serde_json::json!({
             "standard": "escrow",
             "version": "3.0.0",
             "event": event,
             "data": data,
         })
-        .to_string(),
-    );
+    ));
 }
 
 fn ft_transfer_promise(token: &AccountId, receiver: AccountId, amount: u128) -> Promise {
@@ -478,7 +478,7 @@ impl EscrowContract {
     // ========================================
 
     /// Chains FT transfers and attaches a settle_callback to handle success/failure.
-    /// Uses Promise::all() to batch transfers so the callback sees all results.
+    /// Uses .and() to batch transfers so the callback sees all results.
     /// If all transfers succeed → final status (Claimed/Refunded).
     /// If any transfer fails → SettlementFailed (admin can retry).
     fn _settle_escrow(&mut self, job_id: &str) {
@@ -546,13 +546,14 @@ impl EscrowContract {
         #[callback_vec] _results: Vec<Vec<u8>>,
     ) {
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
-        let target = escrow.settlement_target.clone().expect("No settlement target");
+        let target = escrow
+            .settlement_target
+            .clone()
+            .expect("No settlement target");
 
         escrow.status = match target {
             SettlementTarget::Claim => EscrowStatus::Claimed,
-            SettlementTarget::Refund | SettlementTarget::FullRefund => {
-                EscrowStatus::Refunded
-            }
+            SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
         };
         escrow.settlement_target = None;
 

@@ -24,7 +24,7 @@ from scorer import Scorer
 # near-api-py imports
 from near_api.account import Account
 from near_api.providers import JsonProvider
-from near_api.signer import Signer
+from near_api.signer import KeyPair, Signer
 
 logging.basicConfig(
     level=logging.INFO,
@@ -52,7 +52,8 @@ def create_near_client(config: dict) -> NearClient:
         sys.exit(1)
 
     provider = JsonProvider(rpc_url)
-    signer = Signer(verifier_id, key_str)
+    key_pair = KeyPair(key_str)
+    signer = Signer(verifier_id, key_pair)
     account = Account(provider, signer)
 
     return NearClient(config, account)

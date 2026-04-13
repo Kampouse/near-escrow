@@ -1,4 +1,22 @@
-"""LLM Verifier Service for NEAR Escrow.
+"""DEPRECATED — Use the Rust daemon's verifier thread instead.
+
+This Python verifier is superseded by the inlayer daemon's built-in verifier thread.
+The Rust version runs inside `inlayer daemon --foreground` when execution_mode="escrow"
+and requires no separate process.
+
+    Rust equivalent: near-inlayer/worker/src/daemon/escrow_commands.rs
+    CLI: inlayer verifier
+
+The scorer.py multi-pass Gemini logic is preserved and will be ported
+to the Rust verifier in a future iteration. Currently the Rust verifier
+uses a simpler single-pass approach.
+
+Kept for reference. Do not run alongside the Rust daemon —
+they will double-score and potentially double-resume.
+
+---
+
+LLM Verifier Service for NEAR Escrow.
 
 Watches for escrows entering Verifying state, scores the work
 using Gemini with multi-pass verification, and delivers the verdict

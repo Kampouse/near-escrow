@@ -1,4 +1,18 @@
-"""Worker Agent for NEAR Escrow Marketplace (msig-v2 compatible).
+"""DEPRECATED — Use the Rust daemon instead.
+
+This Python worker is superseded by the inlayer daemon's worker thread.
+The Rust version runs inside `inlayer daemon --foreground` when execution_mode="escrow"
+and handles claim → execute → write_kv → submit_result automatically.
+
+    Rust equivalent: near-inlayer/worker/src/daemon/escrow_client.rs
+    See also: near-inlayer/worker/src/daemon/mod.rs (handle_nostr_dispatch)
+
+Kept for reference and testing only. Do not run alongside the Rust daemon —
+they will double-claim tasks.
+
+---
+
+Worker Agent for NEAR Escrow Marketplace (msig-v2 compatible).
 
 Subscribes to Nostr task events (kind 41000), evaluates if the task
 matches capabilities, claims on-chain, executes the task, submits result.

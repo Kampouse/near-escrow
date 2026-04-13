@@ -1,4 +1,16 @@
-"""Post a task to Nostr with a signed msig CreateEscrow action.
+"""DEPRECATED — Use the Rust CLI instead.
+
+This Python script is superseded by `inlayer post-task`.
+The Rust version is the canonical tool for posting tasks.
+
+    Rust equivalent: near-inlayer/worker/src/daemon/escrow_commands.rs
+    CLI: inlayer post-task --nostr-key ... --agent-key ... --msig ...
+
+Kept for reference only.
+
+---
+
+Post a task to Nostr with a signed msig CreateEscrow action.
 
 The agent:
 1. Queries msig.get_nonce() for current nonce

@@ -1,4 +1,18 @@
-"""Nostr Relayer for NEAR Escrow Marketplace (msig-v2).
+"""DEPRECATED — Use the Rust daemon instead.
+
+This Python relayer is superseded by the inlayer daemon's built-in relayer thread.
+The Rust version runs inside `inlayer daemon --foreground` when execution_mode="escrow"
+and requires no separate process.
+
+    Rust equivalent: near-inlayer/worker/src/daemon/escrow_commands.rs
+    CLI: inlayer relayer
+
+Kept for reference and testing only. Do not run alongside the Rust daemon —
+they will double-submit actions.
+
+---
+
+Nostr Relayer for NEAR Escrow Marketplace (msig-v2).
 
 Watches for agent task events (kind 41000) on Nostr relays.
 When a task event contains a signed action, extracts it and calls

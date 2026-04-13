@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AgentTaskEvent",
+  "description": "Nostr event schema for agent task marketplace (NIP-01 compatible)",
+
+  "event_kind": 41000,
+
+  "required_tags": [
+    ["job_id",     "<unique-id> — must match escrow contract job_id"],
+    ["reward",     "<amount>", "<token-contract-account-id>"],
+    ["timeout",    "<hours>"],
+    ["agent",      "<near-account-id>"],
+    ["escrow",     "<escrow-contract-account-id>"]
+  ],
+
+  "optional_tags": [
+    ["verifier_fee",  "<amount>"],
+    ["score_threshold", "<0-100>"],
+    ["category",     "<coding|writing|research|analysis|...>"],
+    ["skills",       "<skill1>", "<skill2>", "..."],
+    ["priority",     "<low|medium|high|urgent>"],
+    ["deadline",     "<unix-timestamp>"]
+  ],
+
+  "content_format": "JSON with task_description and criteria",
+
+  "content_example": {
+    "task_description": "Build a REST API for user authentication with JWT tokens",
+    "criteria": "Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js."
+  },
+
+  "full_event_example": {
+    "pubkey": "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca",
+    "created_at": 1712966400,
+    "kind": 41000,
+    "tags": [
+      ["job_id", "task-2024-0412-001"],
+      ["reward", "5000000", "usdt.tether-token.near"],
+      ["timeout", "48"],
+      ["agent", "kampouse.near"],
+      ["escrow", "escrow.kampouse.near"],
+      ["verifier_fee", "500000"],
+      ["score_threshold", "80"],
+      ["category", "coding"],
+      ["skills", "typescript", "nodejs", "rest-api"]
+    ],
+    "content": "{\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"criteria\":\"Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js.\"}"
+  },
+
+  "event_kind_claimed": 41001,
+  "claim_event_tags": [
+    ["job_id", "<job-id>"],
+    ["worker", "<near-account-id>"],
+    ["escrow", "<escrow-contract-id>"]
+  ],
+
+  "event_kind_result": 41002,
+  "result_event_tags": [
+    ["job_id", "<job-id>"],
+    ["worker", "<near-account-id>"],
+    ["escrow", "<escrow-contract-id>"]
+  ],
+  "result_content_example": {
+    "summary": "Completed REST API with all endpoints, tests passing at 94% coverage",
+    "artifacts": ["https://github.com/worker/repo/pull/1"],
+    "tx_hash": "optional-on-chain-tx-reference"
+  }
+}

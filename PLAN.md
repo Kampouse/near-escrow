@@ -81,45 +81,42 @@ PendingFunding → Open → InProgress → Verifying → Claimed
 - cancel: happy path + wrong caller
 - Views: stats, storage deposit, list_open empty
 
-### 4. Nostr Task Discovery 🔲 (TODO)
-- Agent posts task as Nostr event
-- Workers subscribe to task feed
+### 4. Nostr Task Discovery ✅ (done)
+- Event schema defined (`nostr/event_schema.json`)
+- Three event kinds:
+  - `41000` — Task posted by agent (tags: job_id, reward, timeout, agent, escrow)
+  - `41001` — Worker claimed task
+  - `41002` — Worker submitted result
+- Content is JSON with `task_description` + `criteria`
+- Tags for filtering: category, skills, priority
 
-**Event schema:**
-```
-kind: 41000 (agent task)
-tags:
-  - ["job_id", "<unique-id>"]
-  - ["reward", "<amount>", "<token-contract>"]
-  - ["timeout", "<hours>"]
-  - ["verifier_fee", "<amount>"]
-  - ["score_threshold", "<0-100>"]
-  - ["escrow_contract", "<account.near>"]
-  - ["agent", "<account.near>"]
-content: task description + criteria (JSON or natural language)
-```
+### 5. Relayer ✅ (done)
+- Location: `nostr/relayer.py`
+- WebSocket subscription to task events (kind 41000)
+- Creates on-chain escrow via `create_escrow()` when task detected
+- Attaches 1 NEAR storage deposit
+- Deduplication via processed event cache (10k cap)
+- `--dry-run` mode for watching without creating escrows
 
-### 5. Relayer 🔲 (TODO)
-- Bridges Nostr events → on-chain
-- Watches kind:41000 events
-- Calls `create_escrow()` on behalf of agent (agent signs intent via Nostr)
-- Can leverage existing Nostr→NEAR bridge (layerd port 7201→7203)
-- Agent then funds via `ft_transfer_call`
+### 6. Worker Agent ✅ (done)
+- Location: `nostr/worker.py`
+- Subscribes to task events, filters by capabilities
+- Checks escrow is Open before claiming
+- `claim()` → execute task → `submit_result()` on-chain
+- `_execute_task()` is a placeholder — plug in real agent logic (LLM, code gen, etc.)
+- Capability matching: checks task skills/category against config
 
-### 6. Worker Agent 🔲 (TODO)
-- Subscribes to Nostr task feed (kind:41000)
-- Evaluates if task matches capabilities
-- Calls `claim()` on-chain
-- Does the work
-- Calls `submit_result()` on-chain
-- Waits for verification → payout
+### 7. Post Task Helper ✅ (done)
+- Location: `nostr/post_task.py`
+- CLI tool to post kind 41000 events to Nostr
+- Signs with nostr-sdk, sends to configured relays
 
-### 7. Agent Identity 🔲 (TODO)
+### 8. Agent Identity 🔲 (TODO)
 - How agents link NEAR account ↔ Nostr keypair
 - Options: Nostr event with NEAR signature, or NEAR social profile with npub
 - Needed so workers can verify who posted the task
 
-### 8. Deploy Scripts 🔲 (TODO)
+### 9. Deploy Scripts 🔲 (TODO)
 - Testnet deployment script (cargo-near deploy)
 - Mainnet deployment script
 - Contract initialization (owner setup)
@@ -147,14 +144,14 @@ content: task description + criteria (JSON or natural language)
 - Two-phase funding prevents stuck FT tokens
 - Score consistency enforced on-chain (can't fake passed with low score)
 - Internal state (data_id, settlement_target) never exposed in views
-- `.and()` + `#[callback_vec]` for settlement: all transfers must succeed or state reverts
+- `.and()` + `#[callback_result]` for settlement: failures caught → SettlementFailed → retry_settlement
 
 ## Dependencies
 - near-sdk 5.6+ (yield/resume API)
 - google-genai (Gemini scoring)
 - near-api-py (verifier NEAR RPC)
 - Nostr relays (task discovery — TODO)
-- FastNear RPC (chain queries)
+- FastNear RPC (chain queries — verifier polls `list_verifying()` view)
 
 ## File Structure
 ```
@@ -169,24 +166,31 @@ near-escrow/
 │   ├── config.example.json
 │   ├── requirements.txt
 │   └── .gitignore
-├── Cargo.toml           # Rust deps
-├── PLAN.md              # This file
-├── README.md
+├── nostr/               # Nostr integration ✅
+│   ├── relayer.py       # Nostr → on-chain bridge
+│   ├── worker.py        # Worker agent (claim + execute + submit)
+│   ├── post_task.py     # CLI tool to post tasks
+│   ├── event_schema.json # Event kind definitions
+│   ├── config.example.json
+│   ├── requirements.txt
+│   └── .gitignore
 ├── scripts/             # 🔲 Deploy scripts
 │   ├── deploy_testnet.sh
 │   └── deploy_mainnet.sh
-└── nostr/               # 🔲 Nostr integration
-    ├── event_schema.json
-    ├── relayer.py
-    └── worker.py
+├── Cargo.toml
+├── PLAN.md
+└── README.md
 ```
 
 ## Next Steps
 1. ~~Write verifier service~~ ✅
 2. ~~Write test suite~~ ✅
-3. ~~Fix settlement callback bug~~ ✅
+3. ~~Fix settlement callback bug~~ ✅ (uses `#[callback_result]`, `SettlementFailed` → `retry_settlement`)
 4. ~~Fix EVENT_JSON prefix~~ ✅
-5. Deploy to testnet (deploy scripts)
-6. Build Nostr integration (relayer + worker)
-7. End-to-end test on testnet
-8. Deploy to mainnet
+5. ~~Fix pagination (filter before skip)~~ ✅
+6. ~~Add `list_verifying()` view~~ ✅
+7. ~~Update verifier to poll `list_verifying()` instead of block scanning~~ ✅
+8. ~~Build Nostr integration (relayer + worker + post_task + schema)~~ ✅
+9. Deploy to testnet (deploy scripts)
+10. End-to-end test on testnet
+11. Deploy to mainnet

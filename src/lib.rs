@@ -536,38 +536,54 @@ impl EscrowContract {
     }
 
     /// Callback after FT transfer batch completes.
-    /// Uses #[callback_vec] to collect all results from the .and() batch.
-    /// All transfers must succeed — if any fails, the callback panics (reverts state),
-    /// and the admin can retry via retry_settlement().
-    /// On success → final status (Claimed/Refunded) + storage deposit refund.
-    pub fn settle_callback(
-        &mut self,
-        job_id: String,
-        #[callback_vec] _results: Vec<Vec<u8>>,
-    ) {
+    /// Manually checks ALL promise results (not just one) to catch any failed transfer.
+    /// All succeed → final status (Claimed/Refunded) + storage deposit refund.
+    /// Any fail → SettlementFailed (admin retries via retry_settlement).
+    pub fn settle_callback(&mut self, job_id: String) {
         let mut escrow = self.escrows.get(&job_id).expect("Not found");
         let target = escrow
             .settlement_target
             .clone()
             .expect("No settlement target");
 
-        escrow.status = match target {
-            SettlementTarget::Claim => EscrowStatus::Claimed,
-            SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
-        };
-        escrow.settlement_target = None;
+        // Check ALL promise results — .and() batch creates one result per transfer
+        let count = env::promise_results_count();
+        let mut all_ok = true;
+        for i in 0..count {
+            match env::promise_result_checked(i, 1024) {
+                Ok(_) => {}
+                Err(_) => {
+                    all_ok = false;
+                    break;
+                }
+            }
+        }
 
-        // Refund storage deposit to agent
-        let _ = Promise::new(escrow.agent.clone())
-            .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
+        if all_ok {
+            escrow.status = match target {
+                SettlementTarget::Claim => EscrowStatus::Claimed,
+                SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
+            };
+            escrow.settlement_target = None;
 
-        emit_event(
-            "escrow_settled",
-            &serde_json::json!({
-                "job_id": job_id,
-                "status": format!("{:?}", escrow.status),
-            }),
-        );
+            // Refund storage deposit to agent
+            let _ = Promise::new(escrow.agent.clone())
+                .transfer(NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO));
+
+            emit_event(
+                "escrow_settled",
+                &serde_json::json!({
+                    "job_id": job_id,
+                    "status": format!("{:?}", escrow.status),
+                }),
+            );
+        } else {
+            escrow.status = EscrowStatus::SettlementFailed;
+            emit_event(
+                "settlement_failed",
+                &serde_json::json!({"job_id": job_id}),
+            );
+        }
 
         self.escrows.insert(&job_id, &escrow);
     }
@@ -576,14 +592,16 @@ impl EscrowContract {
     // Admin: retry failed settlements
     // ========================================
 
-    /// Owner can retry a failed settlement
+    /// Owner can retry a failed settlement.
+    /// Also accepts Verifying with settlement_target set — safety net if
+    /// verification_callback partially committed before settle failed.
     pub fn retry_settlement(&mut self, job_id: String) {
         assert_eq!(env::signer_account_id(), self.owner, "Only owner");
         let escrow = self.escrows.get(&job_id).expect("Not found");
-        assert!(
-            escrow.status == EscrowStatus::SettlementFailed,
-            "Not in SettlementFailed"
-        );
+        let valid = escrow.status == EscrowStatus::SettlementFailed
+            || (escrow.status == EscrowStatus::Verifying
+                && escrow.settlement_target.is_some());
+        assert!(valid, "Not retryable — must be SettlementFailed or Verifying with target");
         assert!(escrow.settlement_target.is_some(), "No settlement target");
         self._settle_escrow(&job_id);
     }

@@ -7,7 +7,7 @@ Two half-systems that complete each other:
 - **near-escrow** has payment/settlement (state machine, FT escrow, msig auth, verifier, Nostr discovery) but no execution — workers are stubs that sleep and return JSON.
 - **near-inlayer** has the execution pipeline (daemon, worker routing, job-queue contract, Nostr coordination) but only advisory signaling — no escrow, no trustless settlement, no verifier.
 
-Merged: inlayer's daemon becomes the plumbing layer in the escrow marketplace. Worker agents do the actual work. The daemon routes tasks, writes results to KV, and handles on-chain settlement. One protocol, one flow.
+Merged: inlayer's daemon becomes the plumbing layer in the escrow marketplace. Worker agents (each with their own msig) do the actual work. The daemon routes tasks, relays worker-signed claim/submit actions via msig.execute(), and handles KV writes. One protocol, one flow.
 
 ---
 
@@ -20,15 +20,15 @@ Keep escrow's range, extend with execution lifecycle events. Inlayer's 72xx are 
 | Kind | Name | Who posts | Purpose |
 |------|------|-----------|---------|
 | 41000 | Task | Agent | CreateEscrow signed action + task metadata |
-| 41001 | Claim | Worker | Worker takes job |
-| 41002 | Result | Worker | Work result submitted |
-| 41003 | Action | Agent | Generic msig action (fund, cancel, withdraw, rotate) |
-| 41004 | Dispatch | Daemon | Execution started |
-| 41005 | Confirmed | Daemon | Settlement confirmed on-chain |
+|| 41001 | Claim | Daemon | Worker claimed (via worker_msig.execute) |
+|| 41002 | Result | Worker Agent | Work result + signed claim/submit actions |
+|| 41003 | Action | Agent | Generic msig action (fund, cancel, withdraw, rotate) |
+|| 41004 | Dispatch | Daemon (relayer) | Escrow funded on-chain (FUNDED signal to workers) |
+|| 41005 | Confirmed | Daemon | Settlement confirmed on-chain |
 
 Rationale: 41000-41003 are already deployed in escrow's event_schema.json with full tag specs. Adding 41004/41005 for execution lifecycle is minimal extension. Inlayer's 7201-7205 had no adoption outside the daemon.
 
-### 2. Identity: Keep two-key for agents, single-key for workers
+### 2. Identity: Two-key for all parties
 
 **Agents (task posters):**
 - secp256k1 key → Nostr identity (event signing, discovery)
@@ -38,9 +38,12 @@ Rationale: 41000-41003 are already deployed in escrow's event_schema.json with f
 
 **Workers (execution nodes):**
 - secp256k1 key → Nostr identity (claim/result events)
-- NEAR account (ed25519) → on-chain claim() and submit_result() calls
-- No msig needed — workers go direct to escrow contract
-- Worker msig deferred to v2 (PLAN.md already notes this)
+- ed25519 key → msig authorization (on-chain claim + submit_result via msig.execute)
+- Worker has its own msig — pre-signs claim() and submit_result() actions offline
+- Posts kind 41002 with tags: worker_msig, claim_action, claim_sig, submit_action, submit_sig
+- Daemon relays both actions via msig.execute() — worker's own funds at stake
+- Settlement pays worker's msig directly — real on-chain identity, real reputation
+- Worker never touches RPC or on-chain directly — all via Nostr + pre-signed actions
 
 ### 3. Contracts: Separate, not merged
 
@@ -75,22 +78,23 @@ Relayer picks up 41000
   → calls msig.execute(create_action, sig) → msig calls escrow.create_escrow()
   → calls msig.execute(fund_action, sig) → msig calls ft_transfer_call()
   → escrow: PendingFunding → Open (one shot)
+  → publishes kind 41004 (FUNDED) — signals workers escrow is ready to claim
       ↓
-Inlayer daemon sees 41000 on Nostr (job available)
-  → polls escrow until Open
-  → routes task to a worker agent
-  → calls escrow.claim(job_id) with 0.1N stake on behalf of worker
-  → posts kind 41001 (claimed)
-  → escrow state: InProgress
+Worker agent sees 41004 on Nostr (escrow funded, safe to claim)
+  → does the actual work off-chain
+  → pre-signs claim() with worker msig key (stakes own funds)
+  → pre-signs submit_result() with worker msig key (deterministic kv_reference)
+  → posts kind 41002 (RESULT) to Nostr with tags:
+      job_id, result/output, worker_msig,
+      claim_action, claim_sig (64 bytes ed25519),
+      submit_action, submit_sig (64 bytes ed25519)
       ↓
-Worker agent does the work, returns result to daemon
-  → daemon writes result to FastNear KV (__fastdata_kv call)
-  → posts kind 41004 (dispatched)
-      ↓
-Daemon calls escrow.submit_result(job_id, kv_reference)
-  → posts kind 41002 (result)
+Daemon plumbing thread sees 41002
+  → extracts worker_msig, signed actions, signatures from tags
+  → calls worker_msig.execute(claim_action, claim_sig) → escrow.claim() → InProgress
+  → writes result to FastNear KV via RPC (daemon signer — FastNear, not escrow)
+  → calls worker_msig.execute(submit_action, submit_sig) → escrow.submit_result() → Verifying
   → escrow creates yield promise
-  → escrow state: Verifying
       ↓
 LLM Verifier polls list_verifying()
   → reads kv_reference from escrow result
@@ -100,12 +104,12 @@ LLM Verifier polls list_verifying()
   → yield resumes → verification_callback
       ↓
 Escrow settles:
-  → Passed: ft_transfer worker payout + owner fee
+  → Passed: ft_transfer to worker's msig + owner fee
   → Failed: ft_transfer agent refund + owner fee
   → Timeout: full refund to agent
   → escrow state: Claimed | Refunded | SettlementFailed
       ↓
-Daemon sees settlement on-chain (or via Nostr event)
+Daemon sees settlement on-chain
   → posts kind 41005 (confirmed)
 ```
 
@@ -131,7 +135,7 @@ Changes needed in off-chain services:
 
 ### near-inlayer changes
 
-The daemon is a dumb pipe between the escrow contract and worker agents. It routes tasks to workers, handles KV writes, and submits results on-chain. In escrow mode: claim task → route to worker → write result to KV → submit KV reference to escrow.
+The daemon is a dumb pipe between the escrow contract and worker agents. It routes tasks, relays worker-signed claim/submit actions via msig.execute(), and handles KV writes. The daemon never does work — external AI agents (each with their own msig) do the work and pre-sign on-chain actions. In escrow mode: worker posts 41002 with signed claim+submit → daemon relays via worker_msig.execute() → KV write → settlement.
 
 1. **Nostr kinds** — Replace 7201-7205 with 41000-41005. Update daemon/nostr.rs:
    - `spawn_nostr_subscriber()` subscribes to kinds 41000, 41001, 41003
@@ -141,23 +145,30 @@ The daemon is a dumb pipe between the escrow contract and worker agents. It rout
    - Publish 41004 (dispatched) and 41005 (confirmed) at appropriate points
 
 2. **Daemon main loop (daemon/mod.rs)** — Dual-mode operation:
-   - **Escrow mode** (new): Watch Nostr for 41000 events → poll escrow until Open → claim on escrow contract → route to worker agent → receive result → write to KV → submit_result to escrow contract → wait for settlement
+   - **Escrow mode** (new): Watch Nostr for 41002 events → extract worker msig tags → relay claim via worker_msig.execute() → write result to KV → relay submit_result via worker_msig.execute() → wait for settlement
    - **Direct mode** (existing): Watch inlayer contract for pending requests → execute → resolve on inlayer contract
    - Mode selected by config flag: `execution_mode = "escrow" | "direct" | "both"`
 
-3. **Escrow client** — New module in worker/src/ (e.g., `daemon/escrow_client.rs`):
+3. **Escrow client** — Module in `daemon/escrow_client.rs`:
    - `poll_until_open(job_id)` — Polls escrow get_escrow() view until status is Open, with timeout (10 min)
-   - `claim_escrow(job_id)` — Calls escrow claim() with 0.1N stake
-   - `submit_result(job_id, result)` — Calls escrow submit_result()
+   - `claim(job_id)` — Calls escrow claim() with 0.1N stake (daemon signer fallback)
+   - `claim_via_msig(worker_msig, claim_action, claim_sig)` — Relays pre-signed claim via worker msig
+   - `submit_result(job_id, result)` — Calls escrow submit_result() (daemon signer fallback)
+   - `submit_result_via_msig(worker_msig, submit_action, submit_sig)` — Relays pre-signed submit via worker msig
+   - `write_kv(key, value)` — Writes result to FastNear KV (daemon signer)
    - `wait_for_settlement(job_id)` — Polls escrow get_escrow() until terminal state
+   - `run_escrow_job(...)` — Full lifecycle: claim via worker msig → KV → submit via worker msig → wait
 
-4. **Worker routing + KV write** — The daemon's escrow mode path:
-   - Parse task_description from the Nostr 41000 event
-   - Route task to an available worker agent (LLM, code runner, etc.)
-   - Worker does the work, returns result to daemon
-   - Daemon writes result to FastNear KV via RPC call to any account (e.g. `kv.kampouse.near`) method `__fastdata_kv`, passing `{key: value}` JSON. The target account doesn't need a contract deployed — data is indexed from the transaction itself.
-   - KV key format: `result/{job_id}` — deterministic, easy to reconstruct
-   - Submit the KV reference to the escrow contract as the result: `{"kv_account": "kv.kampouse.near", "kv_predecessor": "daemon.near", "kv_key": "result/{job_id}"}`
+4. **Worker msig relay + KV write** — The daemon's escrow mode path:
+   - Worker agent (external AI, has own msig) sees 41004 (FUNDED) on Nostr
+   - Worker does the work off-chain, pre-signs claim() and submit_result() with msig key
+   - Worker posts kind 41002 to Nostr with signed actions in tags
+   - Daemon plumbing thread extracts worker_msig, claim_action, claim_sig, submit_action, submit_sig
+   - Daemon relays claim via worker_msig.execute(claim_action, claim_sig) — worker stakes own funds
+   - Daemon writes result to FastNear KV via RPC (daemon signer — FastNear, not escrow contract)
+   - KV key format: `result/{job_id}` — deterministic, known at worker sign time
+   - Daemon relays submit_result via worker_msig.execute(submit_action, submit_sig)
+   - KV reference: `{"kv_account": "kv.kampouse.near", "kv_predecessor": "worker_msig", "kv_key": "result/{job_id}"}`
    - Verifier reads full result via HTTP: `GET https://kv.main.fastnear.com/v0/latest/{kv_account}/{kv_predecessor}/{kv_key}`
 
 5. **Config (daemon/manage.rs)** — Add escrow fields to DaemonConfig:
@@ -194,7 +205,7 @@ near-escrow/                          near-inlayer/
 ├── agent-msig/         # Msig contract    │   ├── bin/inlayer.rs   # CLI
 │   └── src/lib.rs      # + 16 tests       │   ├── daemon/
 ├── verifier/           # LLM scoring      │   │   ├── mod.rs       # Main loop (dual-mode)
-│   ├── main.py                          │   │   ├── escrow_client.rs  # NEW
+│   ├── main.py                          │   │   ├── escrow_client.rs  # claim, claim_via_msig, submit_result, submit_result_via_msig, write_kv, run_escrow_job
 │   ├── scorer.py                        │   │   ├── nostr.rs      # Updated kinds
 │   └── near_client.py                   │   │   ├── manage.rs     # Updated config
 ├── nostr/             # Nostr services    │   │   ├── payment.rs   # Direct mode
@@ -212,14 +223,18 @@ near-escrow/                          near-inlayer/
 
 ## Implementation Order
 
-### Phase 1: Wire the daemon to escrow (1-2 days)
+### Phase 1: Wire the daemon to escrow (1-2 days) — DONE
 
-1. Add `escrow_client.rs` to inlayer daemon with poll_until_open, claim, submit_result, wait_for_settlement
-2. Update `nostr.rs` to use 41000-41005 kinds
-3. Add `execution_mode = "escrow"` config to DaemonConfig
-4. Update daemon main loop to support escrow mode
-5. Add KV fetch to verifier (`near_client.py`)
-6. Update event_schema.json with 41004/41005
+1. Add `escrow_client.rs` to inlayer daemon with poll_until_open, claim, claim_via_msig, submit_result, submit_result_via_msig, write_kv, wait_for_settlement, run_escrow_job ✅
+2. Update `nostr.rs` to use 41000-41005 kinds ✅
+3. Add `execution_mode = "escrow"` config to DaemonConfig ✅
+4. Update daemon main loop to support escrow mode ✅
+5. Worker msig: WorkerMsigClaim struct, claim_via_msig, submit_result_via_msig ✅
+6. Relayer publishes 41004 (FUNDED) after create+fund ✅
+7. handle_nostr_result_escrow extracts worker msig tags from 41002 ✅
+8. ThreadHealth + supervisor for crash recovery ✅
+9. READMEs updated with worker msig flow ✅
+10. Python tools deprecated ✅
 
 ### Phase 2: End-to-end test on testnet (1-2 days)
 
@@ -247,7 +262,7 @@ near-escrow/                          near-inlayer/
 | Escrow result (8KB) holds KV reference, not full output | Verifier must fetch from KV before scoring | Simple HTTP GET, public endpoint, no auth needed. Result field is ~150 bytes of JSON. |
 | Yield timeout (~200 blocks / ~2 min) too short for complex tasks | Verification times out, worker loses | Escrow already handles timeout with full refund to agent. Score threshold is the real gate — timeout just means verifier was slow. |
 | "Both" mode runs two watchers | Higher resource usage | Daemon runs Nostr subscriber + contract poller in parallel. Configured per deployment. |
-| Daemon needs two NEAR keys (escrow + inlayer) | Config complexity | In escrow mode, daemon only needs one key (for escrow contract). Inlayer contract key only needed in direct mode. |
+| Daemon needs two NEAR keys (escrow + inlayer) | Config complexity | In escrow mode, daemon only needs one key (for KV writes + relaying worker msig actions). Inlayer contract key only needed in direct mode. Worker has separate msig. |
 | Worker stake (0.1N) may be too low for high-value tasks | Sybil risk | Worker stake is anti-spam, not collateral. The verifier is the quality gate. Increase stake per escrow in v2 if needed. |
 
 ---

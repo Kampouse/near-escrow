@@ -218,6 +218,7 @@ near-escrow/                          near-inlayer/
 ├── PLAN.md                               └── SKILL.md
 ├── MERGED-PLAN.md    # This file
 ├── WORKER-SPEC.md    # Worker protocol spec (kind 41002) — no daemon dependency
+├── WORKER-GUIDE.md   # Worker getting started guide — setup, keys, deployment, flow
 └── README.md
 ```
 

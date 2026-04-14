@@ -44,6 +44,7 @@ Rationale: 41000-41003 are already deployed in escrow's event_schema.json with f
 - Daemon relays both actions via msig.execute() — worker's own funds at stake
 - Settlement pays worker's msig directly — real on-chain identity, real reputation
 - Worker never touches RPC or on-chain directly — all via Nostr + pre-signed actions
+- Full worker protocol spec: [WORKER-SPEC.md](./WORKER-SPEC.md) — workers don't install daemon code, they just post Nostr events
 
 ### 3. Contracts: Separate, not merged
 
@@ -216,6 +217,7 @@ near-escrow/                          near-inlayer/
 │   └── worker.py      # DEPRECATED       └── README.md
 ├── PLAN.md                               └── SKILL.md
 ├── MERGED-PLAN.md    # This file
+├── WORKER-SPEC.md    # Worker protocol spec (kind 41002) — no daemon dependency
 └── README.md
 ```
 

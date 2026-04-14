@@ -6,7 +6,7 @@ Uses NEAR's yield/resume pattern for async LLM verification — the contract yie
 
 ## Merged Architecture
 
-The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain execution plumbing. The inlayer daemon is the dumb pipe — it routes tasks, handles KV writes, and submits results. Three threads run inside a single process.
+The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain execution plumbing. The inlayer daemon is a dumb pipe — it routes tasks, handles on-chain plumbing (claim, KV write, submit_result), but **never does work**. Work is done by external AI agents that interact only via Nostr.
 
 ```
                           NEAR Protocol
@@ -36,15 +36,16 @@ The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain exe
                                │
                     ┌──────────┴─────────────────────────────────────┐
                     │            Inlayer Daemon (1 process)          │
+                    │          "Dumb pipes — routes, never works"    │
                     │                                                │
                     │  ┌──────────────┐  ┌─────────────────────────┐ │
-                    │  │  Relayer     │  │  Worker (main thread)   │ │
-                    │  │  Thread      │  │                         │ │
-                    │  │              │  │  handle_nostr_dispatch  │ │
-                    │  │  Nostr 41000 │  │       │                 │ │
-                    │  │     │        │  │       ├── poll_until_open│ │
-                    │  │     ▼        │  │       ├── claim()       │ │
-                    │  │  msig.execute│  │       ├── WASM execute  │ │
+                    │  │  Relayer     │  │  Plumbing Thread        │ │
+                    │  │  Thread      │  │  (kind 41002 handler)  │ │
+                    │  │              │  │                         │ │
+                    │  │  Nostr 41000 │  │  Agent posts 41002      │ │
+                    │  │     │        │  │       │                 │ │
+                    │  │     ▼        │  │       ├── poll_until_open│ │
+                    │  │  msig.execute│  │       ├── claim()       │ │
                     │  │     │        │  │       ├── write_kv()    │ │
                     │  │     ▼        │  │       ├── submit_result │ │
                     │  │  create+fund │  │       └── wait_settle   │ │
@@ -74,18 +75,20 @@ The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain exe
                     │                             │
                     └─────────────────────────────┘
                                ▲
-                               │
                     ┌──────────┴──────────────────┐
                     │                             │
-                    │   Agent (ed25519 +           │
-                    │          secp256k1 keys)     │
+                    │   Task Agent (posts 41000)  │
+                    │   ed25519 + secp256k1 keys  │
+                    │   inlayer post-task ...      │
                     │                             │
-                    │   inlayer post-task \        │
-                    │     --nostr-key ... \        │
-                    │     --agent-key ... \        │
-                    │     --msig ... \             │
-                    │     --job-id ... \           │
-                    │     --description "..."      │
+                    └─────────────────────────────┘
+                               ▲
+                    ┌──────────┴──────────────────┐
+                    │                             │
+                    │   Worker Agent (posts 41002)│
+                    │   External AI — does the    │
+                    │   actual work, posts result │
+                    │   back to Nostr             │
                     │                             │
                     └─────────────────────────────┘
 ```
@@ -95,7 +98,7 @@ The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain exe
 | Repo | Path | Purpose |
 |------|------|---------|
 | [near-escrow](./) | `near-escrow/` | Escrow + msig contracts, Python tools |
-| [near-inlayer](../near-inlayer/) | `near-inlayer/` | WASM worker daemon, job-queue contract |
+| [near-inlayer](../near-inlayer/) | `near-inlayer/` | Offchain daemon, Nostr routing, escrow plumbing |
 
 ## System Links
 
@@ -115,12 +118,12 @@ The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain exe
 
 | Kind | Name | Direction | Description |
 |------|------|-----------|-------------|
-| 41000 | TASK | Agent → Network | New task with create_escrow + fund_escrow actions |
-| 41001 | CLAIM | Worker → Network | Worker claimed the job |
-| 41002 | RESULT | Worker → Network | Work result submitted |
-| 41003 | ACTION | Agent → Network | Generic msig action (cancel, withdraw, rotate) |
-| 41004 | DISPATCHED | Daemon → Network | Daemon started WASM execution |
-| 41005 | CONFIRMED | Network → Agent | Settlement confirmed on-chain |
+| 41000 | TASK | Task Agent → Network | New task with create_escrow + fund_escrow actions |
+| 41001 | CLAIM | Daemon (plumbing) → Network | Daemon claimed the job on-chain |
+| 41002 | RESULT | Worker Agent → Network | External AI agent posted work result |
+| 41003 | ACTION | Task Agent → Network | Generic msig action (cancel, withdraw, rotate) |
+| 41004 | DISPATCHED | Daemon (relayer) → Network | Escrow created + funded on-chain |
+| 41005 | CONFIRMED | Network → Agents | Settlement confirmed on-chain |
 
 Legacy kinds (7200-7205) supported for backwards compatibility.
 
@@ -129,7 +132,7 @@ Legacy kinds (7200-7205) supported for backwards compatibility.
 Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them.
 
 ```
-AGENT                          NOSTR                          DAEMON                         NEAR ON-CHAIN
+TASK AGENT                     NOSTR                          DAEMON                         NEAR ON-CHAIN
   │                              │                              │                               │
   │  1. Sign CreateEscrow        │                              │                               │
   │     + FundEscrow with        │                              │                               │
@@ -159,42 +162,51 @@ AGENT                          NOSTR                          DAEMON            
   │                              │                              │         create_escrow() ├────►│ PendingFunding
   │                              │                              │         fund_escrow()   ├────►│ Open
   │                              │                              │                               │
-  │                              │  6. Worker thread ──────────►│                               │
-  │                              │     sees same 41000          │                               │
+
+WORKER AGENT (external AI)      │                              │                               │
   │                              │                              │                               │
-  │                              │                              │  7. poll_until_open() ───────►│
-  │                              │                              │     (retries until funded)    │
+  │  6. See kind 41000 ◄────────│                              │                               │
+  │     (task available)         │                              │                               │
   │                              │                              │                               │
-  │                              │                              │  8. claim() ─────────────────►│ InProgress
-  │                              │                              │     (stake deposit)           │
+  │  7. Do actual work (off-chain│                              │                               │
+  │     — this is NOT the daemon)│                              │                               │
   │                              │                              │                               │
-  │                              │  9. POST kind 41001 ◄───────│                               │
-  │                              │     (claim notification)     │                               │
+  │  8. POST kind 41002 ────────►│                              │                               │
+  │     {job_id, result/output}  │                              │                               │
   │                              │                              │                               │
-  │                              │                              │  10. Execute WASM task        │
-  │                              │                              │      (local compute)          │
+  │                              │  9. Plumbing thread ────────►│                               │
+  │                              │     sees 41002               │                               │
   │                              │                              │                               │
-  │                              │                              │  11. Write result to          │
+  │                              │                              │  10. poll_until_open() ──────►│
+  │                              │                              │      (retries until funded)   │
+  │                              │                              │                               │
+  │                              │                              │  11. claim() ────────────────►│ InProgress
+  │                              │                              │      (stake deposit)          │
+  │                              │                              │                               │
+  │                              │  12. POST kind 41001 ◄──────│                               │
+  │                              │      (claim notification)   │                               │
+  │                              │                              │                               │
+  │                              │                              │  13. Write result to          │
   │                              │                              │      FastNear KV via RPC ────►│ KV stored
   │                              │                              │                               │
-  │                              │                              │  12. submit_result() ────────►│ Verifying
+  │                              │                              │  14. submit_result() ────────►│ Verifying
   │                              │                              │      {kv_account, kv_key}     │ (YIELDS)
   │                              │                              │                               │
-  │                              │  13. POST kind 41002 ◄──────│                               │
-  │                              │     (result notification)    │                               │
+  │                              │  15. POST kind 41002 ◄──────│                               │
+  │                              │      (result notification)  │                               │
   │                              │                              │                               │
   │                              │                              │  ─── ~200 block timeout ──── │
   │                              │                              │                               │
-  │                              │                              │  14. Verifier thread          │
+  │                              │                              │  16. Verifier thread          │
   │                              │                              │      polls list_verifying() ─►│
   │                              │                              │                               │
-  │                              │                              │  15. Fetch result from        │
+  │                              │                              │  17. Fetch result from        │
   │                              │                              │      FastNear KV (HTTP GET)   │
   │                              │                              │                               │
-  │                              │                              │  16. Score via Gemini API     │
+  │                              │                              │  18. Score via Gemini API     │
   │                              │                              │      (4 passes, median)       │
   │                              │                              │                               │
-  │                              │                              │  17. resume_verification() ──►│
+  │                              │                              │  19. resume_verification() ──►│
   │                              │                              │      {score, passed}          │
   │                              │                              │                               │
   │                              │                              │                    ┌──────────┤
@@ -208,10 +220,10 @@ AGENT                          NOSTR                          DAEMON            
   │                              │                              │       ft_transfer(worker)├───►│ worker paid
   │                              │                              │       ft_transfer(verifier)├──►│ verifier fee
   │                              │                              │                               │
-  │                              │  18. POST kind 41005 ◄──────│                               │
-  │                              │     (settlement confirmed)   │                               │
+  │                              │  20. POST kind 41005 ◄──────│                               │
+  │                              │      (settlement confirmed) │                               │
   │                              │                              │                               │
-  │  19. See 41005 ◄────────────│                              │                               │
+  │  21. See 41005 ◄────────────│                              │                               │
   │     (agent notified)         │                              │                               │
 ```
 
@@ -250,19 +262,23 @@ AGENT                          NOSTR                          DAEMON            
 ## Escrow Flow
 
 ```
-1. Agent signs CreateEscrow + FundEscrow → posts kind 41000 to Nostr
+1. Task Agent signs CreateEscrow + FundEscrow → posts kind 41000 (TASK) to Nostr
 2. Daemon relayer thread sees 41000 → calls msig.execute() on-chain
    ├── create_escrow()  → escrow created (PendingFunding)
    └── fund_escrow()    → escrow funded (Open)
-3. Daemon worker thread sees 41000 → poll_until_open() → claim()
-4. Worker executes WASM task
-5. Worker writes result to FastNear KV via RPC
-6. Worker calls submit_result() with KV reference → contract YIELDS (Verifying)
-7. Daemon verifier thread polls list_verifying()
+3. External AI agent sees kind 41000 on Nostr → does the actual work
+4. External AI agent posts kind 41002 (RESULT) to Nostr with {job_id, result}
+5. Daemon plumbing thread sees 41002 → runs the on-chain lifecycle:
+   ├── poll_until_open()  → wait for funding
+   ├── claim()            → stake + take job (InProgress)
+   ├── write_kv()         → store result in FastNear KV
+   └── submit_result()    → submit KV ref to contract → YIELDS (Verifying)
+6. Daemon verifier thread polls list_verifying()
    ├── Fetches result from FastNear KV HTTP
    ├── Scores via Gemini API
    └── Calls resume_verification() → settlement_callback()
-8. Settlement: worker paid OR agent refunded
+7. Settlement: worker paid OR agent refunded
+8. Daemon posts kind 41005 (CONFIRMED) to Nostr
 ```
 
 ## Escrow State Machine

@@ -1,38 +1,113 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "title": "AgentTaskEvent",
-  "description": "Nostr event schema for agent task marketplace (NIP-01 compatible)",
+  "title": "EscrowEventSchema",
+  "description": "Nostr event schema for NEAR escrow marketplace (NIP-01 compatible)",
 
-  "event_kind": 41000,
+  "kinds": {
+    "41000": {
+      "name": "TASK",
+      "description": "Agent posts a new task. Contains signed CreateEscrow + FundEscrow actions.",
+      "direction": "agent → relayer → chain",
+      "required_tags": [
+        ["job_id",     "<unique-id> — must match escrow contract job_id"],
+        ["reward",     "<amount>", "<token-contract-account-id>"],
+        ["timeout",    "<hours>"],
+        ["agent",      "<msig-contract-address>"],
+        ["escrow",     "<escrow-contract-account-id>"],
+        ["action",     "<json-string — signed Action object (CreateEscrow) at nonce N>"],
+        ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"],
+        ["fund_action",     "<json-string — signed Action object (FundEscrow) at nonce N+1>"],
+        ["fund_action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
+      ],
+      "optional_tags": [
+        ["npub",           "<nostr-pubkey-hex>"],
+        ["verifier_fee",   "<amount>"],
+        ["score_threshold","<0-100>"],
+        ["category",       "<coding|writing|research|analysis|...>"],
+        ["skills",         "<skill1>", "<skill2>", "..."]
+      ],
+      "content": "JSON with task_description and criteria",
+      "content_example": {
+        "task_description": "Build a REST API for user authentication with JWT tokens",
+        "criteria": "Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage."
+      }
+    },
 
-  "required_tags": [
-    ["job_id",     "<unique-id> — must match escrow contract job_id"],
-    ["reward",     "<amount>", "<token-contract-account-id>"],
-    ["timeout",    "<hours>"],
-    ["agent",      "<msig-contract-address>"],
-    ["escrow",     "<escrow-contract-account-id>"],
-    ["npub",       "<nostr-pubkey-hex>"],
-    ["action",     "<json-string — signed Action object (CreateEscrow)"],
-    ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
-  ],
+    "41001": {
+      "name": "CLAIMED",
+      "description": "Worker claims a task. Deprecated — claim is now embedded in kind 41002.",
+      "direction": "worker → (unused)",
+      "tags": [
+        ["job_id", "<job-id>"],
+        ["worker", "<near-account-id>"],
+        ["escrow", "<escrow-contract-id>"]
+      ]
+    },
 
-  "optional_tags": [
-    ["verifier_fee",  "<amount>"],
-    ["score_threshold", "<0-100>"],
-    ["category",     "<coding|writing|research|analysis|...>"],
-    ["skills",       "<skill1>", "<skill2>", "..."],
-    ["priority",     "<low|medium|high|urgent>"],
-    ["deadline",     "<unix-timestamp>"]
-  ],
+    "41002": {
+      "name": "WORKER_RESULT",
+      "description": "Worker submits task result with pre-signed claim() and submit_result() actions for its msig. Daemon extracts and relays via worker_msig.execute().",
+      "direction": "worker → daemon relayer → chain",
+      "required_tags": [
+        ["job_id",          "<job-id>"],
+        ["worker_msig",     "<worker-msig-contract-address>"],
+        ["claim_action",    "<json-string — signed claim() action at nonce N>"],
+        ["claim_sig",       "<hex-encoded-64-byte-ed25519-signature>"],
+        ["submit_action",   "<json-string — signed submit_result() action at nonce N+1>"],
+        ["submit_sig",      "<hex-encoded-64-byte-ed25519-signature>"]
+      ],
+      "content": "Result text or KV reference JSON",
+      "content_example": {
+        "summary": "Completed REST API with all endpoints, tests passing at 94% coverage",
+        "artifacts": ["https://github.com/worker/repo/pull/1"]
+      },
+      "reference": "See WORKER-SPEC.md for full protocol details"
+    },
 
-  "content_format": "JSON with task_description and criteria",
+    "41003": {
+      "name": "ACTION",
+      "description": "Generic signed action relayed through msig. Used for fund_escrow, cancel_escrow, register_token, rotate_key, withdraw.",
+      "direction": "agent → daemon relayer → chain",
+      "required_tags": [
+        ["agent",      "<msig-contract-address>"],
+        ["action",     "<json-string — the full Action object signed by agent>"],
+        ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
+      ],
+      "content": "empty"
+    },
 
-  "content_example": {
-    "task_description": "Build a REST API for user authentication with JWT tokens",
-    "criteria": "Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js."
+    "41004": {
+      "name": "FUNDED",
+      "description": "Daemon publishes this after successfully creating + funding an escrow on-chain. Workers watch for this event before signing their claim+submit actions.",
+      "direction": "daemon → workers",
+      "required_tags": [
+        ["e",    "<event-id of the kind 41000 that triggered this>"],
+        ["p",    "<pubkey of the task poster>"],
+        ["job_id", "<job-id>"]
+      ],
+      "content": "JSON with create_tx and fund_tx hashes",
+      "content_example": {
+        "job_id": "task-2024-0412-001",
+        "create_tx": "5aB3...full_tx_hash",
+        "fund_tx": "8cD2...full_tx_hash"
+      }
+    },
+
+    "41005": {
+      "name": "CONFIRMED",
+      "description": "Daemon publishes this after escrow settlement completes (verification passed, funds released to worker).",
+      "direction": "daemon → all",
+      "tags": [
+        ["e",       "<event-id of the original kind 41000>"],
+        ["job_id",  "<job-id>"],
+        ["score",   "<0-100>"],
+        ["passed",  "<true|false>"]
+      ],
+      "content": "JSON with settlement details"
+    }
   },
 
-  "full_event_example": {
+  "full_event_example_41000": {
     "pubkey": "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca",
     "created_at": 1712966400,
     "kind": 41000,
@@ -42,42 +117,42 @@
       ["timeout", "48"],
       ["agent", "agent-abc.near"],
       ["escrow", "escrow.kampouse.near"],
-      ["npub", "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca"],
-      ["action", "{\"action\":{\"amount\":\"5000000\",\"criteria\":\"Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js.\",\"job_id\":\"task-2024-0412-001\",\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"timeout_hours\":48,\"token\":\"usdt.tether-token.near\",\"type\":\"create_escrow\"},\"nonce\":1}"],
+      ["action", "{\"action\":{\"amount\":\"5000000\",\"criteria\":\"...\",\"job_id\":\"task-2024-0412-001\",\"task_description\":\"Build a REST API\",\"timeout_hours\":48,\"token\":\"usdt.tether-token.near\",\"type\":\"create_escrow\"},\"nonce\":1}"],
       ["action_sig", "a1b2c3...64-byte-hex-signature"],
-      ["verifier_fee", "500000"],
+      ["fund_action", "{\"action\":{\"amount\":\"5000000\",\"job_id\":\"task-2024-0412-001\",\"type\":\"fund_escrow\"},\"nonce\":2}"],
+      ["fund_action_sig", "d4e5f6...64-byte-hex-signature"],
+      ["npub", "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca"],
       ["score_threshold", "80"],
       ["category", "coding"],
       ["skills", "typescript", "nodejs", "rest-api"]
     ],
-    "content": "{\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"criteria\":\"Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage. TypeScript/Node.js.\"}"
+    "content": "{\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"criteria\":\"Must include: signup, login, logout endpoints.\"}"
   },
 
-  "event_kind_claimed": 41001,
-  "claim_event_tags": [
-    ["job_id", "<job-id>"],
-    ["worker", "<near-account-id>"],
-    ["escrow", "<escrow-contract-id>"]
-  ],
+  "full_event_example_41002": {
+    "pubkey": "worker-nostr-pubkey-hex",
+    "created_at": 1712970000,
+    "kind": 41002,
+    "tags": [
+      ["job_id", "task-2024-0412-001"],
+      ["worker_msig", "worker-msig.near"],
+      ["claim_action", "{\"action\":{\"job_id\":\"task-2024-0412-001\",\"type\":\"claim\"},\"nonce\":1}"],
+      ["claim_sig", "aa11...64-byte-hex-signature"],
+      ["submit_action", "{\"action\":{\"job_id\":\"task-2024-0412-001\",\"result\":\"{\\\"kv_account\\\":\\\"kv.kampouse.near\\\",\\\"kv_predecessor\\\":\\\"worker-msig.near\\\",\\\"kv_key\\\":\\\"result/task-2024-0412-001\\\"}\",\"type\":\"submit_result\"},\"nonce\":2}"],
+      ["submit_sig", "bb22...64-byte-hex-signature"]
+    ],
+    "content": "Work completed successfully"
+  },
 
-  "event_kind_result": 41002,
-  "result_event_tags": [
-    ["job_id", "<job-id>"],
-    ["worker", "<near-account-id>"],
-    ["escrow", "<escrow-contract-id>"]
-  ],
-
-  "event_kind_action": 41003,
-  "action_event_description": "Generic signed action relayed through msig. Used for fund_escrow, cancel_escrow, register_token, rotate_key, withdraw.",
-  "action_event_tags": [
-    ["agent",      "<msig-contract-address>"],
-    ["action",     "<json-string — the full Action object signed by agent>"],
-    ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
-  ],
-  "action_content_example": "",
-  "result_content_example": {
-    "summary": "Completed REST API with all endpoints, tests passing at 94% coverage",
-    "artifacts": ["https://github.com/worker/repo/pull/1"],
-    "tx_hash": "optional-on-chain-tx-reference"
+  "full_event_example_41004": {
+    "pubkey": "daemon-nostr-pubkey-hex",
+    "created_at": 1712966500,
+    "kind": 41004,
+    "tags": [
+      ["e", "original-41000-event-id"],
+      ["p", "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca"],
+      ["job_id", "task-2024-0412-001"]
+    ],
+    "content": "{\"job_id\":\"task-2024-0412-001\",\"create_tx\":\"5aB3...\",\"fund_tx\":\"8cD2...\"}"
   }
 }

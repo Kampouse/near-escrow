@@ -1,4 +1,16 @@
-"""Sign and post a generic msig action to Nostr (kind 41003).
+"""DEPRECATED — Use the Rust CLI instead.
+
+This Python script is superseded by `inlayer post-task`.
+The Rust version handles CreateEscrow + FundEscrow signing in one command.
+
+    Rust equivalent: near-inlayer/worker/src/daemon/escrow_commands.rs
+    CLI: inlayer post-task --nostr-key ... --agent-key ... --msig ...
+
+Kept for reference only.
+
+---
+
+Sign and post a generic msig action to Nostr (kind 41003).
 
 Used for FundEscrow, CancelEscrow, RegisterToken, RotateKey, Withdraw.
 The agent signs the action JSON with its ed25519 key and posts it as a

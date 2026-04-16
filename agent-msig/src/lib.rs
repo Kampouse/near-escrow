@@ -1,6 +1,6 @@
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::{env, near, AccountId, Gas, NearToken, Promise};
+use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise};
 
 // ---------------------------------------------------------------------------
 // Event helper
@@ -19,7 +19,7 @@ fn emit_event(event: &str, data: &near_sdk::serde_json::Value) {
 }
 
 const GAS_FOR_CREATE_ESCROW: Gas = Gas::from_tgas(50);
-const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
+const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(100);
 const GAS_FOR_STORAGE_DEPOSIT: Gas = Gas::from_tgas(10);
 const GAS_FOR_CROSS_CONTRACT: Gas = Gas::from_tgas(20);
 const STORAGE_DEPOSIT_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
@@ -45,6 +45,7 @@ fn encode_ed25519_pubkey(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[near(contract_state)]
+#[derive(PanicOnDefault)]
 pub struct AgentMsig {
     /// Raw ed25519 public key bytes (32 bytes) — used for signature verification
     agent_pubkey: Vec<u8>,
@@ -70,23 +71,6 @@ pub struct AgentMsig {
     window_start_block: u64,
 }
 
-impl Default for AgentMsig {
-    fn default() -> Self {
-        Self {
-            agent_pubkey: vec![0u8; 32],
-            agent_npub: String::new(),
-            escrow_contract: "root".parse().unwrap(),
-            nonce: 0,
-            last_action_block: 0,
-            owner: "root".parse().unwrap(),
-            allowed_tokens: vec![],
-            max_action_value_yocto: 0,
-            daily_limit_yocto: 0,
-            spent_in_window: 0,
-            window_start_block: 0,
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Actions — agent signs the JSON, contract verifies ed25519 signature
@@ -104,6 +88,8 @@ pub enum ActionKind {
         criteria: String,
         verifier_fee: Option<U128>,
         score_threshold: Option<u8>,
+        max_submissions: Option<u32>,
+        deadline_block: Option<u64>,
     },
     FundEscrow {
         job_id: String,
@@ -246,6 +232,8 @@ impl AgentMsig {
                 criteria,
                 verifier_fee,
                 score_threshold,
+                max_submissions,
+                deadline_block,
             } => self._create_escrow(
                 &job_id,
                 amount,
@@ -255,6 +243,8 @@ impl AgentMsig {
                 &criteria,
                 verifier_fee,
                 score_threshold,
+                max_submissions,
+                deadline_block,
             ),
             ActionKind::FundEscrow {
                 job_id,
@@ -420,6 +410,8 @@ impl AgentMsig {
         criteria: &str,
         verifier_fee: Option<U128>,
         score_threshold: Option<u8>,
+        max_submissions: Option<u32>,
+        deadline_block: Option<u64>,
     ) {
         let args = serde_json::to_vec(&serde_json::json!({
             "job_id": job_id,
@@ -430,6 +422,8 @@ impl AgentMsig {
             "criteria": criteria,
             "verifier_fee": verifier_fee,
             "score_threshold": score_threshold,
+            "max_submissions": max_submissions,
+            "deadline_block": deadline_block,
         }))
         .expect("Failed to serialize create_escrow args");
 
@@ -509,7 +503,14 @@ impl AgentMsig {
                 );
             }
             None => {
-                // Withdraw NEAR
+                // Withdraw NEAR — check balance first
+                let balance = env::account_balance();
+                assert!(
+                    balance.as_yoctonear() >= amount.0,
+                    "insufficient NEAR balance: {} < {}",
+                    balance.as_yoctonear(),
+                    amount.0
+                );
                 let _ =
                     Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount.0));
             }
@@ -616,7 +617,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let sig = sign(&sk, action_json);
 
         msig.execute(action_json.to_string(), sig);
@@ -629,12 +630,12 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Nonce 1
-        let action1 = r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action1 = r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action1.to_string(), sign(&sk, action1));
         assert_eq!(msig.get_nonce(), 1);
 
         // Nonce 2
-        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token":"wrap.testnet"}}"#;
+        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action2.to_string(), sign(&sk, action2));
         assert_eq!(msig.get_nonce(), 2);
     }
@@ -650,7 +651,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let wrong_sig = sign(&gen_keypair(), action_json); // different key
 
         msig.execute(action_json.to_string(), wrong_sig);
@@ -663,11 +664,11 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let sig = sign(&sk, action_json);
 
         // Send different JSON than what was signed
-        let tampered = r#"{"nonce":1,"action":{"type":"register_token","token":"evil.testnet"}}"#;
+        let tampered = r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(tampered.to_string(), sig);
     }
 
@@ -691,7 +692,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":5,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":5,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
     }
 
@@ -702,7 +703,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Replay same nonce
@@ -734,7 +735,7 @@ mod tests {
         assert_eq!(msig.get_agent_pubkey(), pubkey_str(&new_sk));
 
         // Old key no longer works
-        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "***"}}"#;
         let old_sig = sign(&old_sk, action2);
 
         // Verify old key fails
@@ -762,7 +763,7 @@ mod tests {
 
         // Execute an action to set last_action_block
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Move past cooldown so owner check runs first
@@ -782,7 +783,7 @@ mod tests {
 
         // Execute an action at block 0
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Try force rotate at block 100 — cooldown is 7200
@@ -800,7 +801,7 @@ mod tests {
 
         // Execute action at block 0
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token":"usdc.testnet"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Force rotate at block 8000 (> 7200 cooldown)
@@ -953,7 +954,7 @@ mod tests {
             "nonce": 1,
             "action": {
                 "type": "register_token",
-                "token": "usdc.near"
+                "token": "***"
             }
         })
         .to_string();
@@ -980,7 +981,7 @@ mod tests {
                 "type": "create_escrow",
                 "job_id": "job-1",
                 "amount": "5000000",
-                "token": "usdc.near",
+                "token": "***",
                 "timeout_hours": 24,
                 "task_description": "Task",
                 "criteria": "Criteria",

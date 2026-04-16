@@ -7,12 +7,14 @@ edition = "2021"
 crate-type = ["cdylib"]
 
 [dependencies]
-near-sdk = { version = "5.6", features = ["legacy"] }
+near-sdk = { version = "=5.6.0", features = ["legacy"] }
 borsh = "1"
+hex = "0.4"
 serde_json = "1"
+sha2 = "0.10"
 
 [dev-dependencies]
-near-sdk = { version = "5.6", features = ["legacy", "unit-testing"] }
+near-sdk = { version = "=5.6.0", features = ["legacy", "unit-testing"] }
 
 [profile.release]
 opt-level = "z"
@@ -20,4 +22,4 @@ lto = true
 strip = true
 
 [workspace]
-members = [".", "agent-msig"]
+members = [".", "agent-msig", "minimal-test", "tests/integration/ft-mock", "tests/integration"]

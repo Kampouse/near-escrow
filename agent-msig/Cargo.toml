@@ -7,12 +7,12 @@ edition = "2021"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-near-sdk = { version = "5.6", features = ["legacy"] }
+near-sdk = { version = "=5.6.0", features = ["legacy"] }
 bs58 = "0.5"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 [dev-dependencies]
-near-sdk = { version = "5.6", features = ["legacy", "unit-testing"] }
+near-sdk = { version = "=5.6.0", features = ["legacy", "unit-testing"] }
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"

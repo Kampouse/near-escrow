@@ -1,6 +1,6 @@
 use near_sdk::json_types::U128;
 use near_sdk::serde::{Deserialize, Serialize};
-use near_sdk::{env, near, AccountId, Gas, NearToken, PanicOnDefault, Promise, PromiseResult};
+use near_sdk::{env, near, AccountId, Gas, NearToken, Promise};
 
 // ---------------------------------------------------------------------------
 // Event helper
@@ -19,11 +19,9 @@ fn emit_event(event: &str, data: &near_sdk::serde_json::Value) {
 }
 
 const GAS_FOR_CREATE_ESCROW: Gas = Gas::from_tgas(50);
-const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(100);
+const GAS_FOR_FT_TRANSFER: Gas = Gas::from_tgas(30);
 const GAS_FOR_STORAGE_DEPOSIT: Gas = Gas::from_tgas(10);
 const GAS_FOR_CROSS_CONTRACT: Gas = Gas::from_tgas(20);
-const GAS_FOR_DESIGNATE_WINNER: Gas = Gas::from_tgas(250); // escrow refunds stakes + 200 Tgas yield create
-const GAS_FOR_CALLBACK: Gas = Gas::from_tgas(5); // callback after cross-contract call
 const STORAGE_DEPOSIT_YOCTO: u128 = 1_000_000_000_000_000_000_000_000; // 1 NEAR
 const FORCE_ROTATE_COOLDOWN_BLOCKS: u64 = 7200; // ~24h
 
@@ -47,7 +45,6 @@ fn encode_ed25519_pubkey(bytes: &[u8]) -> String {
 // ---------------------------------------------------------------------------
 
 #[near(contract_state)]
-#[derive(PanicOnDefault)]
 pub struct AgentMsig {
     /// Raw ed25519 public key bytes (32 bytes) — used for signature verification
     agent_pubkey: Vec<u8>,
@@ -73,6 +70,23 @@ pub struct AgentMsig {
     window_start_block: u64,
 }
 
+impl Default for AgentMsig {
+    fn default() -> Self {
+        Self {
+            agent_pubkey: vec![0u8; 32],
+            agent_npub: String::new(),
+            escrow_contract: "root".parse().unwrap(),
+            nonce: 0,
+            last_action_block: 0,
+            owner: "root".parse().unwrap(),
+            allowed_tokens: vec![],
+            max_action_value_yocto: 0,
+            daily_limit_yocto: 0,
+            spent_in_window: 0,
+            window_start_block: 0,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Actions — agent signs the JSON, contract verifies ed25519 signature
@@ -90,8 +104,6 @@ pub enum ActionKind {
         criteria: String,
         verifier_fee: Option<U128>,
         score_threshold: Option<u8>,
-        max_submissions: Option<u32>,
-        deadline_block: Option<u64>,
     },
     FundEscrow {
         job_id: String,
@@ -112,10 +124,6 @@ pub enum ActionKind {
         token: Option<AccountId>,
         amount: U128,
         recipient: AccountId,
-    },
-    DesignateWinner {
-        job_id: String,
-        winner_idx: u32,
     },
 }
 
@@ -162,37 +170,11 @@ impl AgentMsig {
     /// Relayer submits a signed action from the agent.
     /// 1. Verify ed25519 signature against stored pubkey
     /// 2. Parse action JSON
-    /// 3. Enforce nonce (must be exactly current + 1)
-    /// 4. Consume nonce (replay protection — see design note below)
-    /// 5. Dispatch action with callback
+    //  3. Enforce nonce (must be exactly current + 1)
+    /// 4. Execute the action (cross-contract call or state change)
     ///
     /// Signature covers the raw action_json string — agent and contract must
     /// agree on canonical JSON format. The contract parses AFTER verification.
-    ///
-    /// ## Design: Nonce is consumed before dispatch (intentional)
-    ///
-    /// The nonce is incremented BEFORE the cross-contract call fires. This is
-    /// correct and intentional for two reasons:
-    ///
-    /// 1. **Replay protection** — even if the cross-contract call fails, the
-    ///    nonce is consumed. This prevents a relayer from replaying a signed
-    ///    action after a transient failure (e.g. the escrow was already funded).
-    ///    The agent must re-sign with a fresh nonce, which acknowledges the
-    ///    failure and provides up-to-date intent.
-    ///
-    /// 2. **NEAR's async execution model** — cross-contract calls are promises
-    ///    that resolve AFTER the current function returns. State changes (nonce)
-    ///    are committed when the function completes, before the promise executes.
-    ///    Moving the increment "after" the Promise creation within the same
-    ///    function would make no difference — the function always completes.
-    ///
-    /// To handle failures gracefully, every cross-contract dispatch chains a
-    /// callback (`_on_action_callback`) that emits `action_succeeded` or
-    /// `action_failed` events. Off-chain agents should:
-    ///   - Watch for `action_dispatched` (nonce consumed, dispatch initiated)
-    ///   - Watch for `action_succeeded` (cross-contract call returned OK)
-    ///   - Watch for `action_failed`   (cross-contract call reverted — retry
-    ///     with a new nonce)
     pub fn execute(&mut self, action_json: String, signature: Vec<u8>) {
         // 1. Verify signature
         assert_eq!(
@@ -215,7 +197,7 @@ impl AgentMsig {
         // 2. Parse action
         let action: Action = serde_json::from_str(&action_json).expect("Invalid action JSON");
 
-        // 3. Nonce check — must be exactly current + 1
+        // 3. Nonce check
         assert!(
             action.nonce == self.nonce + 1,
             "Invalid nonce: expected {}, got {}",
@@ -223,7 +205,7 @@ impl AgentMsig {
             action.nonce
         );
 
-        // 4. Consume nonce BEFORE dispatch (replay protection — see doc comment).
+        // 4. Update state (nonce consumed even if cross-contract call fails)
         self.nonce = action.nonce;
         self.last_action_block = env::block_height();
 
@@ -232,7 +214,10 @@ impl AgentMsig {
             self._enforce_spending_limit(value);
         }
 
-        // Determine action type for events
+        // Emit event for off-chain observability.
+        // If the cross-contract call fails, the nonce is still consumed.
+        // Off-chain monitors can detect this by watching for the corresponding
+        // escrow event — if it never appears, the action failed.
         let action_type = match &action.action {
             ActionKind::CreateEscrow { .. } => "create_escrow",
             ActionKind::FundEscrow { .. } => "fund_escrow",
@@ -240,12 +225,9 @@ impl AgentMsig {
             ActionKind::RegisterToken { .. } => "register_token",
             ActionKind::RotateKey { .. } => "rotate_key",
             ActionKind::Withdraw { .. } => "withdraw",
-            ActionKind::DesignateWinner { .. } => "designate_winner",
         };
-
-        // Emit dispatch event — nonce consumed, promise about to be scheduled.
         emit_event(
-            "action_dispatched",
+            "action_executed",
             &near_sdk::serde_json::json!({
                 "nonce": action.nonce,
                 "action_type": action_type,
@@ -253,10 +235,7 @@ impl AgentMsig {
             }),
         );
 
-        // 5. Dispatch — cross-contract calls chain a callback for result tracking.
-        //    Pure state changes (rotate_key) emit success immediately.
-        let nonce = action.nonce;
-        let action_type_str = action_type.to_string();
+        // 5. Dispatch
         match action.action {
             ActionKind::CreateEscrow {
                 job_id,
@@ -267,14 +246,12 @@ impl AgentMsig {
                 criteria,
                 verifier_fee,
                 score_threshold,
-                max_submissions,
-                deadline_block,
             } => {
                 // Validate score_threshold before forwarding to escrow contract
                 if let Some(st) = score_threshold {
                     assert!(st <= 100, "score_threshold must be <= 100, got {}", st);
                 }
-                let promise = self._create_escrow(
+                self._create_escrow(
                     &job_id,
                     amount,
                     &token,
@@ -283,109 +260,21 @@ impl AgentMsig {
                     &criteria,
                     verifier_fee,
                     score_threshold,
-                    max_submissions,
-                    deadline_block,
-                );
-                Self::_chain_callback(promise, nonce, &action_type_str);
+                )
             }
             ActionKind::FundEscrow {
                 job_id,
                 token,
                 amount,
-            } => {
-                let promise = self._fund_escrow(&job_id, &token, amount);
-                Self::_chain_callback(promise, nonce, &action_type_str);
-            }
-            ActionKind::CancelEscrow { job_id } => {
-                let promise = self._cancel_escrow(&job_id);
-                Self::_chain_callback(promise, nonce, &action_type_str);
-            }
-            ActionKind::RegisterToken { token } => {
-                let promise = self._register_token(&token);
-                Self::_chain_callback(promise, nonce, &action_type_str);
-            }
-            ActionKind::RotateKey { new_pubkey } => {
-                // Pure state change — no cross-contract call, always succeeds.
-                self._rotate_key(&new_pubkey);
-                emit_event(
-                    "action_succeeded",
-                    &near_sdk::serde_json::json!({
-                        "nonce": nonce,
-                        "action_type": action_type_str,
-                    }),
-                );
-            }
+            } => self._fund_escrow(&job_id, &token, amount),
+            ActionKind::CancelEscrow { job_id } => self._cancel_escrow(&job_id),
+            ActionKind::RegisterToken { token } => self._register_token(&token),
+            ActionKind::RotateKey { new_pubkey } => self._rotate_key(&new_pubkey),
             ActionKind::Withdraw {
                 token,
                 amount,
                 recipient,
-            } => {
-                let promise = self._withdraw(token, amount, &recipient);
-                Self::_chain_callback(promise, nonce, &action_type_str);
-            }
-            ActionKind::DesignateWinner {
-                job_id,
-                winner_idx,
-            } => {
-                let promise = self._designate_winner(&job_id, winner_idx);
-                Self::_chain_callback(promise, nonce, &action_type_str);
-            }
-        }
-    }
-
-    // -------------------------------------------------------------------
-    // Callback infrastructure for cross-contract call result tracking
-    // -------------------------------------------------------------------
-
-    /// Chains a private callback after a cross-contract promise to emit
-    /// `action_succeeded` or `action_failed`.  The nonce is already consumed
-    /// at this point (replay protection is maintained regardless of outcome).
-    fn _chain_callback(promise: Promise, nonce: u64, action_type: &str) {
-        let callback_args = serde_json::to_vec(&serde_json::json!({
-            "nonce": nonce,
-            "action_type": action_type,
-        }))
-        .expect("Failed to serialize callback args");
-
-        promise.then(
-            Promise::new(env::current_account_id()).function_call(
-                "_on_action_callback".to_string(),
-                callback_args,
-                NearToken::from_yoctonear(0),
-                GAS_FOR_CALLBACK,
-            ),
-        );
-    }
-
-    /// Private callback — only the contract itself may call this.
-    /// Reads the result of the preceding cross-contract call and emits a
-    /// corresponding event so that off-chain agents can detect failures and
-    /// retry with a new nonce.
-    pub fn _on_action_callback(&self, nonce: u64, action_type: String) {
-        assert_eq!(
-            env::predecessor_account_id(),
-            env::current_account_id(),
-            "Callback is private"
-        );
-        match env::promise_result(0) {
-            PromiseResult::Successful(_) => {
-                emit_event(
-                    "action_succeeded",
-                    &near_sdk::serde_json::json!({
-                        "nonce": nonce,
-                        "action_type": action_type,
-                    }),
-                );
-            }
-            PromiseResult::Failed => {
-                emit_event(
-                    "action_failed",
-                    &near_sdk::serde_json::json!({
-                        "nonce": nonce,
-                        "action_type": action_type,
-                    }),
-                );
-            }
+            } => self._withdraw(token, amount, &recipient),
         }
     }
 
@@ -488,7 +377,6 @@ impl AgentMsig {
             ActionKind::CancelEscrow { .. } => None,
             ActionKind::RegisterToken { .. } => None,
             ActionKind::RotateKey { .. } => None,
-            ActionKind::DesignateWinner { .. } => None,
         }
     }
 
@@ -538,9 +426,7 @@ impl AgentMsig {
         criteria: &str,
         verifier_fee: Option<U128>,
         score_threshold: Option<u8>,
-        max_submissions: Option<u32>,
-        deadline_block: Option<u64>,
-    ) -> Promise {
+    ) {
         let args = serde_json::to_vec(&serde_json::json!({
             "job_id": job_id,
             "amount": amount,
@@ -550,20 +436,18 @@ impl AgentMsig {
             "criteria": criteria,
             "verifier_fee": verifier_fee,
             "score_threshold": score_threshold,
-            "max_submissions": max_submissions,
-            "deadline_block": deadline_block,
         }))
         .expect("Failed to serialize create_escrow args");
 
-        Promise::new(self.escrow_contract.clone()).function_call(
+        let _ = Promise::new(self.escrow_contract.clone()).function_call(
             "create_escrow".to_string(),
             args,
             NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO), // storage deposit for escrow
             GAS_FOR_CREATE_ESCROW,
-        )
+        );
     }
 
-    fn _fund_escrow(&self, job_id: &str, token: &AccountId, amount: U128) -> Promise {
+    fn _fund_escrow(&self, job_id: &str, token: &AccountId, amount: U128) {
         let args = serde_json::to_vec(&serde_json::json!({
             "receiver_id": self.escrow_contract.clone(),
             "amount": amount,
@@ -571,56 +455,41 @@ impl AgentMsig {
         }))
         .expect("Failed to serialize ft_transfer_call args");
 
-        Promise::new(token.clone()).function_call(
+        let _ = Promise::new(token.clone()).function_call(
             "ft_transfer_call".to_string(),
             args,
             NearToken::from_yoctonear(1), // 1 yoctoNEAR required by NEP-141
             GAS_FOR_FT_TRANSFER,
-        )
+        );
     }
 
-    fn _designate_winner(&self, job_id: &str, winner_idx: u32) -> Promise {
-        let args = serde_json::to_vec(&serde_json::json!({
-            "job_id": job_id,
-            "winner_idx": winner_idx,
-        }))
-        .expect("Failed to serialize designate_winner args");
-
-        Promise::new(self.escrow_contract.clone()).function_call(
-            "designate_winner".to_string(),
-            args,
-            NearToken::from_yoctonear(0),
-            GAS_FOR_DESIGNATE_WINNER,
-        )
-    }
-
-    fn _cancel_escrow(&self, job_id: &str) -> Promise {
+    fn _cancel_escrow(&self, job_id: &str) {
         let args = serde_json::to_vec(&serde_json::json!({
             "job_id": job_id,
         }))
         .expect("Failed to serialize cancel args");
 
-        Promise::new(self.escrow_contract.clone()).function_call(
+        let _ = Promise::new(self.escrow_contract.clone()).function_call(
             "cancel".to_string(),
             args,
             NearToken::from_yoctonear(0),
             GAS_FOR_CROSS_CONTRACT,
-        )
+        );
     }
 
-    fn _register_token(&self, token: &AccountId) -> Promise {
+    fn _register_token(&self, token: &AccountId) {
         // Register this msig with the FT contract so it can receive tokens
         let args = serde_json::to_vec(&serde_json::json!({
             "account_id": env::current_account_id(),
         }))
         .expect("Failed to serialize storage_deposit args");
 
-        Promise::new(token.clone()).function_call(
+        let _ = Promise::new(token.clone()).function_call(
             "storage_deposit".to_string(),
             args,
             NearToken::from_yoctonear(STORAGE_DEPOSIT_YOCTO), // typical FT storage fee
             GAS_FOR_STORAGE_DEPOSIT,
-        )
+        );
     }
 
     fn _rotate_key(&mut self, new_pubkey: &str) {
@@ -628,7 +497,7 @@ impl AgentMsig {
         self.agent_pubkey = decode_ed25519_pubkey(new_pubkey);
     }
 
-    fn _withdraw(&self, token: Option<AccountId>, amount: U128, recipient: &AccountId) -> Promise {
+    fn _withdraw(&self, token: Option<AccountId>, amount: U128, recipient: &AccountId) {
         match token {
             Some(token_contract) => {
                 // Withdraw FT token
@@ -638,23 +507,17 @@ impl AgentMsig {
                 }))
                 .expect("Failed to serialize ft_transfer args");
 
-                Promise::new(token_contract).function_call(
+                let _ = Promise::new(token_contract).function_call(
                     "ft_transfer".to_string(),
                     args,
                     NearToken::from_yoctonear(1), // 1 yoctoNEAR required by NEP-141
                     GAS_FOR_FT_TRANSFER,
-                )
+                );
             }
             None => {
-                // Withdraw NEAR — check balance first
-                let balance = env::account_balance();
-                assert!(
-                    balance.as_yoctonear() >= amount.0,
-                    "insufficient NEAR balance: {} < {}",
-                    balance.as_yoctonear(),
-                    amount.0
-                );
-                Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount.0))
+                // Withdraw NEAR
+                let _ =
+                    Promise::new(recipient.clone()).transfer(NearToken::from_yoctonear(amount.0));
             }
         }
     }
@@ -759,7 +622,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let sig = sign(&sk, action_json);
 
         msig.execute(action_json.to_string(), sig);
@@ -772,12 +635,12 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Nonce 1
-        let action1 = r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+        let action1 = r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action1.to_string(), sign(&sk, action1));
         assert_eq!(msig.get_nonce(), 1);
 
         // Nonce 2
-        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "wrap.near"}}"#;
+        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action2.to_string(), sign(&sk, action2));
         assert_eq!(msig.get_nonce(), 2);
     }
@@ -793,7 +656,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let wrong_sig = sign(&gen_keypair(), action_json); // different key
 
         msig.execute(action_json.to_string(), wrong_sig);
@@ -806,11 +669,11 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         let sig = sign(&sk, action_json);
 
         // Send different JSON than what was signed
-        let tampered = r#"{"nonce":1,"action":{"type":"register_token","token": "usdc.near"}}"#;
+        let tampered = r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(tampered.to_string(), sig);
     }
 
@@ -834,7 +697,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":5,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":5,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
     }
 
@@ -845,7 +708,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Replay same nonce
@@ -877,7 +740,7 @@ mod tests {
         assert_eq!(msig.get_agent_pubkey(), pubkey_str(&new_sk));
 
         // Old key no longer works
-        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "wrap.near"}}"#;
+        let action2 = r#"{"nonce":2,"action":{"type":"register_token","token": "***"}}"#;
         let old_sig = sign(&old_sk, action2);
 
         // Verify old key fails
@@ -905,7 +768,7 @@ mod tests {
 
         // Execute an action to set last_action_block
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Move past cooldown so owner check runs first
@@ -925,7 +788,7 @@ mod tests {
 
         // Execute an action at block 0
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Try force rotate at block 100 — cooldown is 7200
@@ -943,7 +806,7 @@ mod tests {
 
         // Execute action at block 0
         let action_json =
-            r#"{"nonce":1,"action":{"type":"register_token","token": "wrap.near"}}"#;
+            r#"{"nonce":1,"action":{"type":"register_token","token": "***"}}"#;
         msig.execute(action_json.to_string(), sign(&sk, action_json));
 
         // Force rotate at block 8000 (> 7200 cooldown)
@@ -993,8 +856,6 @@ mod tests {
                 criteria: "All tests pass".to_string(),
                 verifier_fee: Some(U128(100_000)),
                 score_threshold: Some(80),
-                max_submissions: None,
-                deadline_block: None,
             },
         };
 
@@ -1021,12 +882,12 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Set whitelist to allow only usdc.near
-        let ctx = setup();
+        let mut ctx = setup();
         testing_env!(ctx.build());
         msig.set_allowed_tokens(vec!["usdc.near".parse().unwrap()]);
 
         // usdc.near calls ft_on_transfer — should accept
-        let ctx = setup();
+        let mut ctx = setup();
         ctx.predecessor_account_id("usdc.near".parse().unwrap());
         testing_env!(ctx.build());
 
@@ -1044,7 +905,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Set whitelist to allow only usdc.near
-        let ctx = setup();
+        let mut ctx = setup();
         testing_env!(ctx.build());
         msig.set_allowed_tokens(vec!["usdc.near".parse().unwrap()]);
 
@@ -1089,7 +950,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Set per-action limit of 1M and daily limit of 10M
-        let ctx = setup();
+        let mut ctx = setup();
         testing_env!(ctx.build());
         msig.set_spending_limits(U128(1_000_000), U128(10_000_000));
 
@@ -1098,7 +959,7 @@ mod tests {
             "nonce": 1,
             "action": {
                 "type": "register_token",
-                "token": "wrap.near"
+                "token": "***"
             }
         })
         .to_string();
@@ -1114,7 +975,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Set per-action limit of 1M
-        let ctx = setup();
+        let mut ctx = setup();
         testing_env!(ctx.build());
         msig.set_spending_limits(U128(1_000_000), U128(0)); // daily = unlimited
 
@@ -1125,7 +986,7 @@ mod tests {
                 "type": "create_escrow",
                 "job_id": "job-1",
                 "amount": "5000000",
-                "token": "wrap.near",
+                "token": "***",
                 "timeout_hours": 24,
                 "task_description": "Task",
                 "criteria": "Criteria",
@@ -1144,7 +1005,7 @@ mod tests {
         let mut msig = new_msig(&sk);
 
         // Set per-action = unlimited, daily = 10M
-        let ctx = setup();
+        let mut ctx = setup();
         testing_env!(ctx.build());
         msig.set_spending_limits(U128(0), U128(10_000_000));
 

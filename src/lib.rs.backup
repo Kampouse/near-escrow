@@ -29,45 +29,13 @@ const VERIFICATION_SAFETY_TIMEOUT_MS: u64 = 24 * 3600 * 1000;
 
 // --- Verifier verdict ---
 
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
+#[derive(BorshDeserialize, BorshSerialize, Serialize, Clone, Debug)]
 #[borsh(crate = "near_sdk::borsh")]
 #[serde(crate = "near_sdk::serde")]
 pub struct VerifierVerdict {
     pub score: u8,
     pub passed: bool,
     pub detail: String,
-}
-
-// --- Multi-verifier consensus types ---
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
-#[borsh(crate = "near_sdk::borsh")]
-#[serde(crate = "near_sdk::serde")]
-pub struct VerifierInfo {
-    pub account_id: AccountId,
-    /// ed25519 public key (32 bytes hex) for signature verification
-    pub public_key: String,
-    pub active: bool,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
-#[borsh(crate = "near_sdk::borsh")]
-#[serde(crate = "near_sdk::serde")]
-pub struct VerifierSignature {
-    /// Index into verifier_set
-    pub verifier_index: u8,
-    /// ed25519 signature (64 bytes)
-    pub signature: Vec<u8>,
-}
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Deserialize, Clone, Debug)]
-#[borsh(crate = "near_sdk::borsh")]
-#[serde(crate = "near_sdk::serde")]
-pub struct SignedVerdict {
-    /// JSON verdict: {"score": u8, "passed": bool, "detail": String}
-    pub verdict_json: String,
-    /// ed25519 signatures from verifiers
-    pub signatures: Vec<VerifierSignature>,
 }
 
 // --- Escrow status ---
@@ -107,35 +75,6 @@ pub enum EscrowMode {
     Competitive, // Multiple workers submit, agent designates winner
 }
 
-// --- Worker account (internal wallet) ---
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Clone)]
-#[borsh(crate = "near_sdk::borsh")]
-#[serde(crate = "near_sdk::serde")]
-pub struct WorkerAccount {
-    pub nostr_pubkey: String,
-    pub near_account_id: Option<AccountId>,
-    pub nonce: u64,
-}
-
-#[derive(Serialize, Clone)]
-#[serde(crate = "near_sdk::serde")]
-pub struct WorkerAccountView {
-    pub nostr_pubkey: String,
-    pub near_account_id: Option<AccountId>,
-    pub nonce: u64,
-}
-
-impl From<WorkerAccount> for WorkerAccountView {
-    fn from(w: WorkerAccount) -> Self {
-        WorkerAccountView {
-            nostr_pubkey: w.nostr_pubkey,
-            near_account_id: w.near_account_id,
-            nonce: w.nonce,
-        }
-    }
-}
-
 // --- Competitive submission ---
 
 #[derive(BorshDeserialize, BorshSerialize, Serialize, Clone)]
@@ -145,11 +84,7 @@ pub struct Submission {
     pub worker: AccountId,
     pub result: String,
     pub stake: U128, // Anti-spam bond, refunded to non-winners on designate
-    pub worker_pubkey: Option<String>, // Internal wallet identity (ed25519 hex)
 }
-
-// Max retries for failed settlements before auto-cancel
-const MAX_SETTLEMENT_RETRIES: u8 = 5;
 
 // --- Escrow record (internal) ---
 
@@ -176,15 +111,12 @@ pub struct Escrow {
     pub settlement_target: Option<SettlementTarget>,
     pub worker_stake: Option<U128>, // Anti-spam bond (0.1 NEAR), refunded on settle
     pub yield_consumed: bool,       // Guard against double resume_verification
-    // Internal wallet — worker identity (ed25519 hex pubkey)
-    pub worker_pubkey: Option<String>,
     // Competitive mode fields
     pub mode: EscrowMode,
     pub max_submissions: Option<u32>,
     pub submissions: Vec<Submission>,  // Competitive: all worker submissions
     pub winner_idx: Option<u32>,       // Competitive: index of winning submission
     pub deadline_block: Option<u64>,   // Competitive: optional submission deadline
-    pub retry_count: u8,               // Settlement retry counter (auto-cancel after MAX_SETTLEMENT_RETRIES)
 }
 
 // --- Escrow view (public, no internal fields) ---
@@ -210,8 +142,6 @@ pub struct EscrowView {
     pub max_submissions: Option<u32>,
     pub submission_count: u32,
     pub winner_idx: Option<u32>,
-    pub worker_pubkey: Option<String>,
-    pub retry_count: u8,
 }
 
 impl From<Escrow> for EscrowView {
@@ -235,8 +165,6 @@ impl From<Escrow> for EscrowView {
             max_submissions: e.max_submissions,
             submission_count: e.submissions.len() as u32,
             winner_idx: e.winner_idx,
-            worker_pubkey: e.worker_pubkey,
-            retry_count: e.retry_count,
         }
     }
 }
@@ -244,14 +172,13 @@ impl From<Escrow> for EscrowView {
 // --- Helpers ---
 
 fn emit_event(event: &str, data: &serde_json::Value) {
-    // NEP-297 compliant event format
     env::log_str(&format!(
         "EVENT_JSON:{}",
         &serde_json::json!({
             "standard": "escrow",
-            "version": "3.2.0",
+            "version": "3.1.0",
             "event": event,
-            "data": [data],
+            "data": data,
         })
     ));
 }
@@ -273,162 +200,21 @@ fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn hex_decode(hex: &str) -> Vec<u8> {
-    assert!(hex.len() % 2 == 0, "Invalid hex length");
-    (0..hex.len())
-        .step_by(2)
-        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("Invalid hex char"))
-        .collect()
-}
-
-/// Non-panicking hex decode — returns None on invalid input.
-fn hex_decode_safe(hex: &str) -> Option<Vec<u8>> {
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut bytes = Vec::with_capacity(hex.len() / 2);
-    for i in (0..hex.len()).step_by(2) {
-        match u8::from_str_radix(&hex[i..i + 2], 16) {
-            Ok(b) => bytes.push(b),
-            Err(_) => return None,
-        }
-    }
-    Some(bytes)
-}
-
-/// Sentinel token ID for native NEAR in internal balances.
-const NEAR_TOKEN_ID: &str = "near";
-
-fn balance_key(worker_pubkey: &str, token: &str) -> String {
-    format!("{}:{}", worker_pubkey, token)
-}
-
-fn verify_worker_signature(pubkey_hex: &str, message: &str, signature: &[u8]) {
-    let pk_bytes = hex_decode(pubkey_hex);
-    assert_eq!(pk_bytes.len(), 32, "Invalid pubkey: expected 32 bytes, got {}", pk_bytes.len());
-    assert_eq!(signature.len(), 64, "Invalid signature: expected 64 bytes, got {}", signature.len());
-    let pk: [u8; 32] = pk_bytes.try_into().expect("pk len checked");
-    let sig: [u8; 64] = signature.try_into().expect("sig len checked");
-    assert!(
-        env::ed25519_verify(&sig, message.as_bytes(), &pk),
-        "Invalid worker signature"
-    );
-}
-
-/// Credit a worker's internal balance. Returns the previous balance.
-fn credit_balance(
-    balances: &mut UnorderedMap<String, U128>,
-    worker_pubkey: &str,
-    token: &str,
-    amount: u128,
-) {
-    let key = balance_key(worker_pubkey, token);
-    let current = balances.get(&key).unwrap_or(U128(0)).0;
-    balances.insert(&key, &U128(current.saturating_add(amount)));
-}
-
-/// Debit a worker's internal balance. Panics if insufficient.
-fn debit_balance(
-    balances: &mut UnorderedMap<String, U128>,
-    worker_pubkey: &str,
-    token: &str,
-    amount: u128,
-) {
-    let key = balance_key(worker_pubkey, token);
-    let current = balances.get(&key).unwrap_or(U128(0)).0;
-    assert!(current >= amount, "Insufficient internal balance: have {}, need {}", current, amount);
-    balances.insert(&key, &U128(current.saturating_sub(amount)));
-}
-
-// --- Cached stats (O(1) get_stats) ---
-
-#[derive(BorshDeserialize, BorshSerialize, Serialize, Clone, Debug, Default)]
-#[borsh(crate = "near_sdk::borsh")]
-#[serde(crate = "near_sdk::serde")]
-pub struct EscrowStats {
-    pub total_created: u64,
-    pub pending_funding: u64,
-    pub open: u64,
-    pub in_progress: u64,
-    pub verifying: u64,
-    pub claimed: u64,
-    pub refunded: u64,
-    pub cancelled: u64,
-    pub settlement_failed: u64,
-}
-
-impl EscrowStats {
-    fn total(&self) -> u64 {
-        self.pending_funding
-            .saturating_add(self.open)
-            .saturating_add(self.in_progress)
-            .saturating_add(self.verifying)
-            .saturating_add(self.claimed)
-            .saturating_add(self.refunded)
-            .saturating_add(self.cancelled)
-            .saturating_add(self.settlement_failed)
-    }
-}
-
 // --- Contract ---
 
 #[near(contract_state)]
 #[derive(PanicOnDefault)]
 pub struct EscrowContract {
     owner: AccountId,
-    /// Two-step owner transfer: new owner must accept
-    pending_owner: Option<AccountId>,
-    /// Global pause switch — blocks create_escrow, claim, submit_result when true
-    paused: bool,
     escrows: UnorderedMap<String, Escrow>,
-    /// Multi-verifier consensus set.
-    verifier_set: Vec<VerifierInfo>,
-    /// Min signatures needed for consensus (default 2).
-    consensus_threshold: u8,
+    /// Verifier account — the only account allowed to resume verification.
+    verifier: AccountId,
     /// Reverse index: hex(data_id) → job_id — O(1) lookup for resume_verification.
     data_id_index: UnorderedMap<String, String>,
     /// Configurable storage deposit per escrow (default 1 NEAR).
     storage_deposit_yocto: u128,
     /// Configurable worker anti-spam stake (default 0.1 NEAR).
     worker_stake_yocto: u128,
-    /// Internal wallet: worker accounts keyed by ed25519 pubkey hex.
-    workers: UnorderedMap<String, WorkerAccount>,
-    /// Internal wallet: balances keyed by "pubkey_hex:token_id".
-    /// token_id is AccountId string for FT tokens, "near" for native NEAR.
-    balances: UnorderedMap<String, U128>,
-    /// Paused/banned worker pubkeys — admin can pause/unpause.
-    /// Paused workers cannot claim, submit, or withdraw.
-    paused_workers: UnorderedMap<String, bool>,
-    /// Whitelist of accepted FT token contracts. Empty = accept all (dangerous).
-    allowed_tokens: Vec<AccountId>,
-    /// Cached aggregate stats — O(1) reads, updated on every state transition.
-    stats: EscrowStats,
-}
-
-/// Helper: decrement the counter for old_status, increment for new_status.
-fn transition_stats(stats: &mut EscrowStats, old_status: &EscrowStatus, new_status: &EscrowStatus) {
-    // Decrement old
-    match old_status {
-        EscrowStatus::PendingFunding => stats.pending_funding = stats.pending_funding.saturating_sub(1),
-        EscrowStatus::Open => stats.open = stats.open.saturating_sub(1),
-        EscrowStatus::InProgress => stats.in_progress = stats.in_progress.saturating_sub(1),
-        EscrowStatus::Verifying => stats.verifying = stats.verifying.saturating_sub(1),
-        EscrowStatus::Claimed => stats.claimed = stats.claimed.saturating_sub(1),
-        EscrowStatus::Refunded => stats.refunded = stats.refunded.saturating_sub(1),
-        EscrowStatus::Cancelled => stats.cancelled = stats.cancelled.saturating_sub(1),
-        EscrowStatus::SettlementFailed => stats.settlement_failed = stats.settlement_failed.saturating_sub(1),
-    }
-    // Increment new
-    match new_status {
-        EscrowStatus::PendingFunding => stats.pending_funding = stats.pending_funding.saturating_add(1),
-        EscrowStatus::Open => stats.open = stats.open.saturating_add(1),
-        EscrowStatus::InProgress => stats.in_progress = stats.in_progress.saturating_add(1),
-        EscrowStatus::Verifying => stats.verifying = stats.verifying.saturating_add(1),
-        EscrowStatus::Claimed => stats.claimed = stats.claimed.saturating_add(1),
-        EscrowStatus::Refunded => stats.refunded = stats.refunded.saturating_add(1),
-        EscrowStatus::Cancelled => stats.cancelled = stats.cancelled.saturating_add(1),
-        EscrowStatus::SettlementFailed => stats.settlement_failed = stats.settlement_failed.saturating_add(1),
-    }
 }
 
 
@@ -442,525 +228,18 @@ const MAX_COMPETITIVE_RESULT_LEN: usize = 2048;
 #[near]
 impl EscrowContract {
     #[init]
-    pub fn new(
-        verifier_set: Vec<VerifierInfo>,
-        consensus_threshold: Option<u8>,
-        allowed_tokens: Vec<AccountId>,
-    ) -> Self {
+    pub fn new(verifier_account_id: Option<AccountId>) -> Self {
+        // Prevent re-initialization — state already exists from first call
         assert!(!env::state_exists(), "Contract already initialized");
         let owner = env::signer_account_id();
-
-        // Validate verifiers
-        assert!(!verifier_set.is_empty(), "At least 1 verifier required");
-        for v in &verifier_set {
-            assert!(v.public_key.len() == 64, "Invalid pubkey length for {}", v.account_id);
-        }
-        let threshold = consensus_threshold.unwrap_or(2);
-        let active_count = verifier_set.iter().filter(|v| v.active).count();
-        assert!(threshold as usize <= active_count, "Threshold exceeds active verifiers");
-        assert!(threshold >= 1, "Threshold must be >= 1");
-
         Self {
-            owner,
-            pending_owner: None,
-            paused: false,
+            owner: owner.clone(),
             escrows: UnorderedMap::new(b"e"),
-            verifier_set,
-            consensus_threshold: threshold,
+            verifier: verifier_account_id.unwrap_or(owner),
             data_id_index: UnorderedMap::new(b"d"),
             storage_deposit_yocto: STORAGE_DEPOSIT_YOCTO,
             worker_stake_yocto: WORKER_STAKE_YOCTO,
-            workers: UnorderedMap::new(b"w"),
-            balances: UnorderedMap::new(b"b"),
-            paused_workers: UnorderedMap::new(b"p"),
-            allowed_tokens,
-            stats: EscrowStats::default(),
         }
-    }
-
-    // ========================================
-    // Admin: multi-verifier management
-    // ========================================
-
-    /// Add a verifier to the consensus set. Owner-only.
-    pub fn add_verifier(&mut self, account_id: AccountId, public_key: String) {
-        assert!(
-            env::predecessor_account_id() == self.owner,
-            "Only owner can manage verifiers"
-        );
-        assert!(public_key.len() == 64, "Public key must be 64 hex chars");
-        // Check not already in set
-        for v in &self.verifier_set {
-            assert!(v.account_id != account_id, "Verifier already in set");
-        }
-        self.verifier_set.push(VerifierInfo {
-            account_id,
-            public_key,
-            active: true,
-        });
-    }
-
-    /// Remove a verifier (deactivate — don't shift indices). Owner-only.
-    pub fn deactivate_verifier(&mut self, index: u8) {
-        assert!(
-            env::predecessor_account_id() == self.owner,
-            "Only owner"
-        );
-        let idx = index as usize;
-        assert!(idx < self.verifier_set.len(), "Invalid verifier index");
-        self.verifier_set[idx].active = false;
-    }
-
-    /// Update consensus threshold. Owner-only.
-    pub fn set_consensus_threshold(&mut self, threshold: u8) {
-        assert!(
-            env::predecessor_account_id() == self.owner,
-            "Only owner"
-        );
-        let active_count = self.verifier_set.iter().filter(|v| v.active).count();
-        assert!(threshold as usize <= active_count, "Threshold exceeds active verifiers");
-        assert!(threshold >= 1, "Threshold must be >= 1");
-        self.consensus_threshold = threshold;
-    }
-
-    /// Get current verifier set
-    pub fn get_verifier_set(&self) -> Vec<VerifierInfo> {
-        self.verifier_set.clone()
-    }
-
-    /// Check if multi-verifier mode is active
-    pub fn is_multi_verifier(&self) -> bool {
-        !self.verifier_set.is_empty()
-    }
-
-    // ========================================
-    // Admin: owner transfer (2-step)
-    // ========================================
-
-    /// Step 1: Propose new owner. Current owner only.
-    pub fn propose_owner(&mut self, new_owner: AccountId) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        emit_event("owner_proposed", &serde_json::json!({"new_owner": new_owner.to_string()}));
-        self.pending_owner = Some(new_owner);
-    }
-
-    /// Step 2: Accept ownership. Must be called by the proposed new owner.
-    pub fn accept_owner(&mut self) {
-        let caller = env::predecessor_account_id();
-        let pending = self.pending_owner.take();
-        match pending {
-            Some(ref po) if po == &caller => {
-                self.owner = caller.clone();
-                emit_event("owner_transferred", &serde_json::json!({"new_owner": caller}));
-            }
-            Some(po) => {
-                // Wrong caller — put it back
-                self.pending_owner = Some(po);
-                panic!("Not the proposed owner");
-            }
-            None => panic!("No pending owner transfer"),
-        }
-    }
-
-    /// Get pending owner (if any)
-    pub fn get_pending_owner(&self) -> Option<AccountId> {
-        self.pending_owner.clone()
-    }
-
-    // ========================================
-    // Admin: global pause
-    // ========================================
-
-    /// Pause all escrow operations (create, claim, submit). Owner-only.
-    /// Existing escrows continue through verification/settlement.
-    pub fn pause(&mut self) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        self.paused = true;
-        emit_event("contract_paused", &serde_json::json!({}));
-    }
-
-    /// Unpause the contract. Owner-only.
-    pub fn unpause(&mut self) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        self.paused = false;
-        emit_event("contract_unpaused", &serde_json::json!({}));
-    }
-
-    /// Check if contract is paused
-    pub fn is_paused(&self) -> bool {
-        self.paused
-    }
-
-    // ========================================
-    // Admin: token whitelist
-    // ========================================
-
-    /// Add a token to the whitelist. Owner-only. Empty whitelist = accept all.
-    pub fn add_allowed_token(&mut self, token: AccountId) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        if !self.allowed_tokens.contains(&token) {
-            self.allowed_tokens.push(token);
-        }
-    }
-
-    /// Remove a token from the whitelist. Owner-only.
-    pub fn remove_allowed_token(&mut self, token: AccountId) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        self.allowed_tokens.retain(|t| t != &token);
-    }
-
-    /// Get list of allowed tokens. Empty = all tokens accepted.
-    pub fn get_allowed_tokens(&self) -> Vec<AccountId> {
-        self.allowed_tokens.clone()
-    }
-
-    fn is_token_allowed(&self, token: &AccountId) -> bool {
-        self.allowed_tokens.is_empty() || self.allowed_tokens.contains(token)
-    }
-
-    // ========================================
-    // Internal wallet: worker registration & deposits
-    // ========================================
-
-    /// Register a worker by their Nostr ed25519 pubkey.
-    /// Owner-only: the daemon controls worker registration.
-    /// Workers are auto-registered on first claim_for/submit_result_for if not yet registered.
-    pub fn register_worker(&mut self, nostr_pubkey: String) {
-        assert!(
-            env::predecessor_account_id() == self.owner,
-            "Only owner can register workers"
-        );
-        assert!(!nostr_pubkey.is_empty(), "Pubkey required");
-        assert!(
-            nostr_pubkey.len() == 64,
-            "Pubkey must be 64 hex chars (32 bytes), got {}",
-            nostr_pubkey.len()
-        );
-        assert!(
-            self.workers.get(&nostr_pubkey).is_none(),
-            "Already registered"
-        );
-        assert!(
-            self.paused_workers.get(&nostr_pubkey).is_none(),
-            "Worker is paused/banned"
-        );
-        self.workers.insert(&nostr_pubkey, &WorkerAccount {
-            nostr_pubkey: nostr_pubkey.clone(),
-            near_account_id: None,
-            nonce: 0,
-        });
-        emit_event(
-            "worker_registered",
-            &serde_json::json!({ "worker_pubkey": nostr_pubkey }),
-        );
-    }
-
-    /// Deposit native NEAR into a worker's internal balance.
-    /// Anyone can call (daemon fronts stakes, worker self-funds, etc).
-    #[payable]
-    pub fn deposit_to_worker(&mut self, worker_pubkey: String) {
-        let amount = env::attached_deposit().as_yoctonear();
-        assert!(amount > 0, "Must attach NEAR deposit");
-        assert!(
-            self.workers.get(&worker_pubkey).is_some(),
-            "Worker not registered — call register_worker first"
-        );
-        assert!(
-            self.paused_workers.get(&worker_pubkey).is_none(),
-            "Worker is paused"
-        );
-        credit_balance(&mut self.balances, &worker_pubkey, NEAR_TOKEN_ID, amount);
-        emit_event(
-            "worker_deposit",
-            &serde_json::json!({
-                "worker_pubkey": worker_pubkey,
-                "amount": amount.to_string(),
-                "token": "near",
-            }),
-        );
-    }
-
-    /// Worker withdraws from internal balance to an external NEAR account.
-    /// Worker signs: "withdraw:{token}:{amount}:{to}:{nonce}" with their Nostr key.
-    /// Anyone can relay the signed message (daemon, worker themselves, etc).
-    pub fn withdraw(
-        &mut self,
-        worker_pubkey: String,
-        token: String,
-        amount: U128,
-        to: AccountId,
-        signature: Vec<u8>,
-    ) {
-        assert!(
-            self.paused_workers.get(&worker_pubkey).is_none(),
-            "Worker is paused"
-        );
-        let mut worker = self.workers.get(&worker_pubkey).expect("Worker not registered");
-        let message = format!("{}:withdraw:{}:{}:{}:{}", env::current_account_id(), token, amount.0, to, worker.nonce);
-        verify_worker_signature(&worker_pubkey, &message, &signature);
-
-        // Debit internal balance
-        debit_balance(&mut self.balances, &worker_pubkey, &token, amount.0);
-
-        // Increment nonce
-        worker.nonce = worker.nonce.saturating_add(1);
-        self.workers.insert(&worker_pubkey, &worker);
-
-        // Execute FT transfer (or NEAR transfer for native)
-        if token == NEAR_TOKEN_ID {
-            Promise::new(to.clone()).transfer(NearToken::from_yoctonear(amount.0));
-        } else {
-            let token_account: AccountId = token.parse().expect("Invalid token account ID");
-            let _ = ft_transfer_promise(&token_account, to.clone(), amount.0);
-        }
-
-        emit_event(
-            "worker_withdraw",
-            &serde_json::json!({
-                "worker_pubkey": worker_pubkey,
-                "token": token.to_string(),
-                "amount": amount.0.to_string(),
-                "to": to.to_string(),
-            }),
-        );
-    }
-
-    /// Link a NEAR account to a worker for direct withdrawal calls.
-    /// Worker signs: "link:{near_account_id}:{nonce}" with their Nostr key.
-    pub fn link_near_account(
-        &mut self,
-        worker_pubkey: String,
-        near_account_id: AccountId,
-        signature: Vec<u8>,
-    ) {
-        let mut worker = self.workers.get(&worker_pubkey).expect("Worker not registered");
-        let message = format!("link:{}:{}", near_account_id, worker.nonce);
-        verify_worker_signature(&worker_pubkey, &message, &signature);
-        worker.nonce = worker.nonce.saturating_add(1);
-        worker.near_account_id = Some(near_account_id.clone());
-        self.workers.insert(&worker_pubkey, &worker);
-        emit_event(
-            "near_account_linked",
-            &serde_json::json!({
-                "worker_pubkey": worker_pubkey,
-                "near_account_id": near_account_id,
-            }),
-        );
-    }
-
-    // ========================================
-    // Internal wallet: claim & submit via pubkey
-    // ========================================
-
-    /// Worker claims an open escrow via Nostr key signature.
-    /// Stake is deducted from internal NEAR balance (no attached deposit needed).
-    /// Daemon relays the signed message on behalf of the worker.
-    pub fn claim_for(&mut self, job_id: String, worker_pubkey: String, worker_signature: Vec<u8>) {
-        assert!(!self.paused, "Contract is paused");
-        // Auto-register if needed
-        if self.workers.get(&worker_pubkey).is_none() {
-            self.workers.insert(&worker_pubkey, &WorkerAccount {
-                nostr_pubkey: worker_pubkey.clone(),
-                near_account_id: None,
-                nonce: 0,
-            });
-        }
-
-        // Pause check
-        assert!(
-            self.paused_workers.get(&worker_pubkey).is_none(),
-            "Worker is paused"
-        );
-
-        // Verify worker identity with nonce + contract domain separator
-        let worker = self.workers.get(&worker_pubkey).expect("Worker not registered");
-        let message = format!("{}:claim:{}:{}", env::current_account_id(), job_id, worker.nonce);
-        verify_worker_signature(&worker_pubkey, &message, &worker_signature);
-
-        // Increment nonce after successful verification
-        let mut worker = worker;
-        worker.nonce = worker.nonce.saturating_add(1);
-        self.workers.insert(&worker_pubkey, &worker);
-
-        let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
-        assert!(escrow.status == EscrowStatus::Open, "Escrow not open");
-        assert!(escrow.worker.is_none() && escrow.worker_pubkey.is_none(), "Already claimed");
-        assert!(
-            worker_pubkey != escrow.agent.to_string(),
-            "Agent cannot claim own escrow"
-        );
-
-        // Deduct stake from internal NEAR balance
-        debit_balance(&mut self.balances, &worker_pubkey, NEAR_TOKEN_ID, self.worker_stake_yocto);
-
-        escrow.worker_pubkey = Some(worker_pubkey.clone());
-        escrow.worker = Some(env::signer_account_id()); // daemon/relayer as fallback
-        escrow.worker_stake = Some(U128(self.worker_stake_yocto));
-        escrow.status = EscrowStatus::InProgress;
-        transition_stats(&mut self.stats, &EscrowStatus::Open, &EscrowStatus::InProgress);
-        self.escrows.insert(&job_id, &escrow);
-
-        emit_event(
-            "escrow_claimed_by_worker",
-            &serde_json::json!({
-                "job_id": job_id,
-                "worker_pubkey": worker_pubkey,
-            }),
-        );
-    }
-
-    /// Worker submits result via Nostr key signature.
-    /// For standard mode: must be the assigned worker (claimed via claim_for).
-    /// For competitive mode: adds submission, deducts stake from internal balance.
-    pub fn submit_result_for(
-        &mut self,
-        job_id: String,
-        result: String,
-        worker_pubkey: String,
-        worker_signature: Vec<u8>,
-    ) {
-        assert!(!self.paused, "Contract is paused");
-        assert!(!result.is_empty(), "Result cannot be empty");
-        assert!(
-            result.len() <= MAX_RESULT_LEN,
-            "Result too long (max {} bytes)",
-            MAX_RESULT_LEN
-        );
-
-        // Auto-register if needed
-        if self.workers.get(&worker_pubkey).is_none() {
-            self.workers.insert(&worker_pubkey, &WorkerAccount {
-                nostr_pubkey: worker_pubkey.clone(),
-                near_account_id: None,
-                nonce: 0,
-            });
-        }
-
-        // Pause check
-        assert!(
-            self.paused_workers.get(&worker_pubkey).is_none(),
-            "Worker is paused"
-        );
-
-        // Verify worker identity with nonce + contract domain separator
-        let worker = self.workers.get(&worker_pubkey).expect("Worker not registered");
-        let message = format!("{}:submit_result:{}:{}", env::current_account_id(), job_id, worker.nonce);
-        verify_worker_signature(&worker_pubkey, &message, &worker_signature);
-
-        // Increment nonce after successful verification
-        let mut worker = worker;
-        worker.nonce = worker.nonce.saturating_add(1);
-        self.workers.insert(&worker_pubkey, &worker);
-
-        let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
-
-        match escrow.mode {
-            EscrowMode::Competitive => {
-                assert!(
-                    escrow.status == EscrowStatus::Open,
-                    "Competitive: escrow must be Open"
-                );
-                assert!(
-                    result.len() <= MAX_COMPETITIVE_RESULT_LEN,
-                    "Competitive result too long (max {} bytes)",
-                    MAX_COMPETITIVE_RESULT_LEN
-                );
-                if let Some(deadline) = escrow.deadline_block {
-                    assert!(
-                        env::block_height() <= deadline,
-                        "Submission deadline passed"
-                    );
-                }
-                // Deduct stake from internal NEAR balance
-                debit_balance(
-                    &mut self.balances,
-                    &worker_pubkey,
-                    NEAR_TOKEN_ID,
-                    self.worker_stake_yocto,
-                );
-                // Idempotent
-                if escrow.submissions.iter().any(|s| s.worker_pubkey.as_ref() == Some(&worker_pubkey)) {
-                    // Refund the stake we just deducted
-                    credit_balance(&mut self.balances, &worker_pubkey, NEAR_TOKEN_ID, self.worker_stake_yocto);
-                    return;
-                }
-                let max = escrow.max_submissions.unwrap_or(u32::MAX);
-                assert!(
-                    (escrow.submissions.len() as u32) < max,
-                    "Max submissions reached"
-                );
-                escrow.submissions.push(Submission {
-                    worker: env::signer_account_id(),
-                    result: result.clone(),
-                    stake: U128(self.worker_stake_yocto),
-                    worker_pubkey: Some(worker_pubkey.clone()),
-                });
-                self.escrows.insert(&job_id, &escrow);
-                emit_event(
-                    "competitive_submission",
-                    &serde_json::json!({
-                        "job_id": job_id,
-                        "worker_pubkey": worker_pubkey,
-                        "submission_count": escrow.submissions.len(),
-                    }),
-                );
-                return; // Stay Open — wait for designate_winner
-            }
-            EscrowMode::Standard => {
-                // Idempotent guard
-                if escrow.status == EscrowStatus::Verifying
-                    && escrow.worker_pubkey.as_ref() == Some(&worker_pubkey)
-                    && escrow.data_id.is_some()
-                {
-                    return;
-                }
-
-                assert!(escrow.status == EscrowStatus::InProgress, "Not in progress");
-                assert_eq!(
-                    escrow.worker_pubkey.as_ref(),
-                    Some(&worker_pubkey),
-                    "Not the worker"
-                );
-
-                escrow.result = Some(result);
-            }
-        }
-
-        // Create yield promise (same as existing submit_result)
-        let callback_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id}))
-            .expect("callback args serialization failed");
-        let _promise = env::promise_yield_create(
-            "verification_callback",
-            &callback_args,
-            GAS_FOR_YIELD_CALLBACK,
-            GasWeight(0),
-            DATA_ID_REGISTER,
-        );
-        let data_id_bytes = env::read_register(DATA_ID_REGISTER)
-            .expect("data_id register not set — promise_yield_create failed");
-        let data_id: CryptoHash = data_id_bytes
-            .as_slice()
-            .try_into()
-            .expect("data_id must be 32 bytes");
-
-        escrow.data_id = Some(data_id);
-        escrow.status = EscrowStatus::Verifying;
-        transition_stats(
-            &mut self.stats,
-            &EscrowStatus::InProgress,
-            &EscrowStatus::Verifying,
-        );
-        self.escrows.insert(&job_id, &escrow);
-        self.data_id_index.insert(&hex_encode(data_id.as_ref()), &job_id);
-
-        emit_event(
-            "result_submitted",
-            &serde_json::json!({
-                "job_id": job_id,
-                "data_id": hex_encode(data_id.as_ref()),
-                "worker_pubkey": worker_pubkey,
-            }),
-        );
     }
 
     // ========================================
@@ -984,11 +263,13 @@ impl EscrowContract {
         max_submissions: Option<u32>,
         deadline_block: Option<u64>,
     ) {
-        assert!(!self.paused, "Contract is paused");
         let agent = env::signer_account_id();
         assert!(!job_id.is_empty(), "Job ID required");
-        assert!(job_id.len() <= MAX_JOB_ID_LEN, "Job ID too long (max {} bytes)", MAX_JOB_ID_LEN);
-        assert!(self.is_token_allowed(&token), "Token not allowed");
+        assert!(
+            job_id.len() <= MAX_JOB_ID_LEN,
+            "Job ID too long (max {} bytes)",
+            MAX_JOB_ID_LEN
+        );
         assert!(amount.0 > 0, "Amount must be > 0");
         assert!(
             timeout_hours <= 8760,
@@ -1052,18 +333,14 @@ impl EscrowContract {
             settlement_target: None,
             worker_stake: None,
             yield_consumed: false,
-            worker_pubkey: None,
             mode,
             max_submissions,
             submissions: Vec::new(),
             winner_idx: None,
             deadline_block,
-            retry_count: 0,
         };
 
         self.escrows.insert(&job_id, &escrow);
-        self.stats.total_created += 1;
-        self.stats.pending_funding += 1;
 
         emit_event(
             "escrow_created",
@@ -1090,12 +367,6 @@ impl EscrowContract {
     /// Returns U128(0) to accept all tokens, or U128(amount) to reject.
     pub fn ft_on_transfer(&mut self, sender_id: AccountId, amount: U128, msg: String) -> U128 {
         let token_contract = env::predecessor_account_id();
-
-        // Reject tokens not on the whitelist
-        if !self.is_token_allowed(&token_contract) {
-            return U128(amount.0);
-        }
-
         let job_id = msg;
 
         let mut escrow = match self.escrows.get(&job_id) {
@@ -1118,7 +389,6 @@ impl EscrowContract {
         }
 
         escrow.status = EscrowStatus::Open;
-        transition_stats(&mut self.stats, &EscrowStatus::PendingFunding, &EscrowStatus::Open);
         self.escrows.insert(&job_id, &escrow);
 
         emit_event(
@@ -1144,7 +414,6 @@ impl EscrowContract {
     /// Requires 0.1 NEAR attached deposit as anti-spam bond.
     #[payable]
     pub fn claim(&mut self, job_id: String) {
-        assert!(!self.paused, "Contract is paused");
         let caller = env::signer_account_id();
         let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
         assert!(escrow.status == EscrowStatus::Open, "Escrow not open");
@@ -1160,10 +429,8 @@ impl EscrowContract {
 
         escrow.worker = Some(caller.clone());
         escrow.worker_stake = Some(U128(attached));
-        let old_status = escrow.status;
         escrow.status = EscrowStatus::InProgress;
         self.escrows.insert(&job_id, &escrow);
-        transition_stats(&mut self.stats, &old_status, &EscrowStatus::InProgress);
 
         emit_event(
             "escrow_claimed_by_worker",
@@ -1186,7 +453,6 @@ impl EscrowContract {
     /// In competitive mode: appends submission, stays Open until designate_winner.
     #[payable]
     pub fn submit_result(&mut self, job_id: String, result: String) {
-        assert!(!self.paused, "Contract is paused");
         let caller = env::signer_account_id();
         let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
         assert!(!result.is_empty(), "Result cannot be empty");
@@ -1223,12 +489,8 @@ impl EscrowContract {
                     "Competitive submission requires {} yoctoNEAR stake",
                     self.worker_stake_yocto
                 );
-                // Idempotent: if this worker already submitted, refund attached deposit and return
+                // Idempotent: if this worker already submitted, return success without counting again
                 if escrow.submissions.iter().any(|s| s.worker == caller) {
-                    let attached = env::attached_deposit();
-                    if attached.as_yoctonear() > 0 {
-                        Promise::new(caller).transfer(attached);
-                    }
                     return;
                 }
                 // Cap check
@@ -1237,11 +499,10 @@ impl EscrowContract {
                     (escrow.submissions.len() as u32) < max,
                     "Max submissions reached"
                 );
-escrow.submissions.push(Submission {
-                    worker: env::signer_account_id(),
+                escrow.submissions.push(Submission {
+                    worker: caller.clone(),
                     result: result.clone(),
-                    stake: U128(self.worker_stake_yocto),
-                    worker_pubkey: None,
+                    stake: U128(attached),
                 });
                 self.escrows.insert(&job_id, &escrow);
                 emit_event(
@@ -1305,129 +566,59 @@ escrow.submissions.push(Submission {
     }
 
     // ========================================
-    // 5a. Multi-verifier consensus resume
+    // 5a. LLM Verifier calls resume_verification
     // ========================================
 
-    /// Resume verification with multi-verifier consensus signatures.
-    /// Callable by anyone — trust is in the signatures, not the caller.
-    /// Requires `consensus_threshold` valid ed25519 signatures from the verifier_set.
-    pub fn resume_verification_multi(
-        &mut self,
-        data_id_hex: String,
-        signed_verdict: SignedVerdict,
-    ) -> bool {
-        // Must have verifier_set configured
-        assert!(!self.verifier_set.is_empty(), "No verifier set configured");
-
-        // Gas bound: no more signatures than verifiers
-        assert!(
-            signed_verdict.signatures.len() <= self.verifier_set.len(),
-            "Too many signatures: {} > {}",
-            signed_verdict.signatures.len(),
-            self.verifier_set.len()
+    /// Called by the verifier service to deliver the verdict.
+    /// Internally calls env::promise_yield_resume() which triggers
+    /// verification_callback as the yield completion.
+    ///
+    /// Args:
+    ///   data_id_hex — hex-encoded CryptoHash from the `result_submitted` event
+    ///   verdict — JSON string: {"score": 85, "passed": true, "detail": "..."}
+    pub fn resume_verification(&mut self, data_id_hex: String, verdict: String) -> bool {
+        // Only the designated verifier can resume
+        assert_eq!(
+            env::predecessor_account_id(),
+            self.verifier,
+            "Only verifier can resume"
         );
 
-        // Build scoped message: signatures bind to (data_id || verdict_json)
-        // Prevents replay across escrows
-        let scoped_message = format!("{}:{}", data_id_hex, signed_verdict.verdict_json);
-
-        // Verify consensus signatures
-        let valid_sigs = self.count_valid_signatures(scoped_message.as_bytes(), &signed_verdict.signatures);
-        assert!(
-            valid_sigs >= self.consensus_threshold,
-            "Insufficient valid signatures: {} < {}",
-            valid_sigs,
-            self.consensus_threshold
-        );
-
-        // Parse verdict for sanity check
-        let _verdict: VerifierVerdict = serde_json::from_str(&signed_verdict.verdict_json)
-            .unwrap_or_else(|_| panic!("Invalid verdict JSON"));
-
-        // Double-resume guard
+        // Double-resume guard: O(1) index lookup instead of O(n) scan.
         let matching_job = self.data_id_index.get(&data_id_hex);
-        let job_id_for_guard = matching_job.clone();
-        if let Some(ref jid) = matching_job {
-            let escrow = self.escrows.get(jid).expect("escrow vanished during index lookup");
+        if let Some(jid) = matching_job {
+            let escrow = self.escrows.get(&jid).expect("escrow vanished during index lookup");
             assert!(!escrow.yield_consumed, "Yield already consumed");
-        }
-
-        // Decode data_id
-        assert!(data_id_hex.len() == 64, "data_id must be 64 hex chars");
-        let data_id_bytes: Vec<u8> = (0..64)
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&data_id_hex[i..i + 2], 16)
-                    .unwrap_or_else(|_| panic!("Invalid hex at position {}", i))
-            })
-            .collect();
-        let data_id: [u8; 32] = data_id_bytes.try_into().expect("data_id must be 32 bytes");
-
-        // Resume yield — payload is the verdict JSON (not scoped message)
-        // verification_callback reads this payload
-        let payload = signed_verdict.verdict_json.as_bytes();
-        env::promise_yield_resume(&data_id, payload);
-
-        // Mark consumed
-        if let Some(jid) = job_id_for_guard {
-            let mut escrow = self.escrows.get(&jid).expect("escrow vanished");
+            // SAFETY: yield_consumed is set to true BEFORE calling promise_yield_resume.
+            // This is safe because promise_yield_resume is a NEAR host function — it cannot
+            // "fail" in the Rust sense. If the host function panics (e.g. invalid data_id),
+            // the entire transaction reverts, so the state change is rolled back too.
+            // Setting early prevents double-execution if the callback somehow fires twice,
+            // which is a worse failure mode than a stuck escrow (stuck can be force-cancelled).
+            let mut escrow = escrow;
             escrow.yield_consumed = true;
             self.escrows.insert(&jid, &escrow);
         }
 
-        true
-    }
+        // Decode hex data_id to bytes — strict validation
+        assert!(
+            data_id_hex.len() == 64,
+            "data_id_hex must be 64 hex chars (32 bytes), got {}",
+            data_id_hex.len()
+        );
+        let data_id_bytes: Vec<u8> = (0..64)
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&data_id_hex[i..i + 2], 16)
+                    .unwrap_or_else(|_| panic!("Invalid hex at position {}: '{}'", i, &data_id_hex[i..i + 2]))
+            })
+            .collect();
 
-    /// Count valid ed25519 signatures from active verifiers.
-    /// Returns usize to avoid u8 overflow. Silently skips invalid pubkeys.
-    fn count_valid_signatures(
-        &self,
-        message: &[u8],
-        signatures: &[VerifierSignature],
-    ) -> u8 {
-        let mut seen_indices = std::collections::HashSet::new();
-        let mut valid: usize = 0;
+        let data_id: [u8; 32] = data_id_bytes.try_into().expect("data_id must be 32 bytes");
 
-        for sig in signatures {
-            let idx = sig.verifier_index as usize;
+        let payload = verdict.as_bytes();
 
-            if seen_indices.contains(&idx) {
-                continue;
-            }
-            seen_indices.insert(idx);
-
-            if idx >= self.verifier_set.len() {
-                continue;
-            }
-            let verifier = &self.verifier_set[idx];
-            if !verifier.active {
-                continue;
-            }
-
-            // Gracefully handle bad pubkey stored in verifier_set
-            let pk_bytes = match hex_decode_safe(&verifier.public_key) {
-                Some(b) if b.len() == 32 => b,
-                _ => continue,
-            };
-            if sig.signature.len() != 64 {
-                continue;
-            }
-
-            let pk_array: [u8; 32] = match pk_bytes.try_into() {
-                Ok(a) => a,
-                _ => continue,
-            };
-            let sig_array: [u8; 64] = match sig.signature.clone().try_into() {
-                Ok(a) => a,
-                _ => continue,
-            };
-
-            if near_sdk::env::ed25519_verify(&sig_array, message, &pk_array) {
-                valid += 1;
-            }
-        }
-
-        valid as u8
+        env::promise_yield_resume(&data_id, payload)
     }
 
     // ========================================
@@ -1502,12 +693,7 @@ escrow.submissions.push(Submission {
                         // Full refund to agent + worker stake refunded. Verifier failed, not the worker.
                         log!("Verifier sent malformed payload: {}", e);
                         if let Some(stake) = escrow.worker_stake {
-                            if let Some(ref wpk) = escrow.worker_pubkey {
-                                // Internal wallet: credit worker's NEAR balance
-                                credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                                log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (malformed verdict)", stake.0, wpk);
-                            } else if let Some(ref worker) = escrow.worker {
-                                // Legacy: direct NEAR transfer
+                            if let Some(ref worker) = escrow.worker {
                                 Promise::new(worker.clone())
                                     .transfer(NearToken::from_yoctonear(stake.0));
                                 log!("Refunding worker stake: {} yoctoNEAR to {} (malformed verdict)", stake.0, worker);
@@ -1531,12 +717,7 @@ escrow.submissions.push(Submission {
                 // Worker stake REFUNDED to worker — timeout is verifier's fault, not worker's.
                 // Worker already did the work and submitted the result.
                 if let Some(stake) = escrow.worker_stake {
-                    if let Some(ref wpk) = escrow.worker_pubkey {
-                        // Internal wallet: credit worker's NEAR balance
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                        log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (verification timeout)", stake.0, wpk);
-                    } else if let Some(ref worker) = escrow.worker {
-                        // Legacy: direct NEAR transfer
+                    if let Some(ref worker) = escrow.worker {
                         Promise::new(worker.clone())
                             .transfer(NearToken::from_yoctonear(stake.0));
                         log!("Refunding worker stake: {} yoctoNEAR to {} (verification timeout)", stake.0, worker);
@@ -1586,90 +767,7 @@ escrow.submissions.push(Submission {
         let total = escrow.amount.0;
         let vfee = escrow.verifier_fee.0;
 
-        // For worker_pubkey escrows: credit internal balance instead of FT-transfer to daemon.
-        // The daemon (relayer) is escrow.worker but shouldn't receive the payout — the worker owns it.
-        // Worker withdraws on their own schedule via withdraw().
-        if let Some(ref wpk) = escrow.worker_pubkey {
-            match target {
-                SettlementTarget::Claim => {
-                    let payout = total.saturating_sub(vfee);
-                    assert!(payout > 0, "Worker payout is zero");
-                    credit_balance(&mut self.balances, wpk, &token.to_string(), payout);
-                    if vfee > 0 {
-                        // Verifier fee goes to owner via FT transfer (not internal)
-                    }
-                    let mut transfers = vec![];
-                    if vfee > 0 {
-                        transfers.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
-                    }
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
-                    self.escrows.insert(&job_id_string, &escrow);
-                    if transfers.is_empty() {
-                        // No external transfers needed — settle immediately
-                        return self._settle_callback_internal(&job_id_string);
-                    }
-                    // Still need to FT-transfer verifier fee
-                    let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args");
-                    let settle_cb = Promise::new(env::current_account_id()).function_call(
-                        "settle_callback".to_string(),
-                        settle_args,
-                        NearToken::from_yoctonear(0),
-                        GAS_FOR_SETTLE_CALLBACK,
-                    );
-                    let batch = transfers.into_iter().reduce(|acc, p| acc.and(p)).expect("at least one");
-                    let _ = batch.then(settle_cb);
-                    return;
-                }
-                SettlementTarget::Refund => {
-                    let refund = total.saturating_sub(vfee);
-                    assert!(refund > 0, "Agent refund is zero");
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
-                    self.escrows.insert(&job_id_string, &escrow);
-                    // FT-transfer refund to agent + verifier fee to owner
-                    let mut transfers = vec![ft_transfer_promise(&token, escrow.agent.clone(), refund)];
-                    if vfee > 0 {
-                        transfers.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
-                    }
-                    let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args");
-                    let settle_cb = Promise::new(env::current_account_id()).function_call(
-                        "settle_callback".to_string(),
-                        settle_args,
-                        NearToken::from_yoctonear(0),
-                        GAS_FOR_SETTLE_CALLBACK,
-                    );
-                    let batch = transfers.into_iter().reduce(|acc, p| acc.and(p)).expect("at least one");
-                    let _ = batch.then(settle_cb);
-                    return;
-                }
-                SettlementTarget::FullRefund => {
-                    assert!(total > 0, "Nothing to refund");
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
-                    self.escrows.insert(&job_id_string, &escrow);
-                    let transfers = vec![ft_transfer_promise(&token, escrow.agent.clone(), total)];
-                    let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args");
-                    let settle_cb = Promise::new(env::current_account_id()).function_call(
-                        "settle_callback".to_string(),
-                        settle_args,
-                        NearToken::from_yoctonear(0),
-                        GAS_FOR_SETTLE_CALLBACK,
-                    );
-                    let batch = transfers.into_iter().reduce(|acc, p| acc.and(p)).expect("at least one");
-                    let _ = batch.then(settle_cb);
-                    return;
-                }
-            }
-        }
-
-        // Legacy path: no worker_pubkey — direct FT transfer to escrow.worker (NEAR account)
+        // Build transfer promises
         let transfers: Vec<Promise> = match target {
             SettlementTarget::Claim => {
                 let worker = escrow.worker.clone().expect("No worker for claim");
@@ -1698,6 +796,7 @@ escrow.submissions.push(Submission {
             }
         };
 
+        // Batch all transfers via .and() for parallel execution, then callback
         let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args serialization failed");
         let settle_cb = Promise::new(env::current_account_id()).function_call(
             "settle_callback".to_string(),
@@ -1706,37 +805,12 @@ escrow.submissions.push(Submission {
             GAS_FOR_SETTLE_CALLBACK,
         );
 
+        // Join all transfers with .and(), then chain the callback
         let batch = transfers
             .into_iter()
             .reduce(|acc, p| acc.and(p))
             .expect("At least one transfer required");
         let _ = batch.then(settle_cb);
-    }
-
-    /// Internal helper: directly settle escrow when all payouts are internal (no FT transfers).
-    fn _settle_callback_internal(&mut self, job_id: &String) {
-        let mut escrow = self.escrows.get(job_id).expect("Escrow not found");
-        let target = escrow.settlement_target.clone().expect("No settlement target");
-        escrow.status = match target {
-            SettlementTarget::Claim => EscrowStatus::Claimed,
-            SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
-        };
-        escrow.settlement_target = None;
-
-        // Refund storage deposit to agent
-        Promise::new(escrow.agent.clone())
-            .transfer(NearToken::from_yoctonear(self.storage_deposit_yocto));
-
-        escrow.worker_stake = None;
-        emit_event(
-            "escrow_settled",
-            &serde_json::json!({
-                "job_id": job_id,
-                "status": format!("{:?}", escrow.status),
-                "internal_wallet": true,
-            }),
-        );
-        self.escrows.insert(job_id, &escrow);
     }
 
     /// Callback after FT transfer batch completes.
@@ -1784,10 +858,7 @@ escrow.submissions.push(Submission {
 
             // Refund worker stake on successful settlement (worker did their job)
             if let Some(stake) = escrow.worker_stake {
-                if let Some(ref wpk) = escrow.worker_pubkey {
-                    // Internal wallet: already credited in _settle_escrow, just clear
-                    log!("Worker stake already credited to internal wallet {} (settlement)", wpk);
-                } else if let Some(ref worker) = escrow.worker {
+                if let Some(ref worker) = escrow.worker {
                     Promise::new(worker.clone()).transfer(NearToken::from_yoctonear(stake.0));
                     log!("Refunding worker stake: {} yoctoNEAR to {} (settlement)", stake.0, worker);
                 }
@@ -1819,7 +890,7 @@ escrow.submissions.push(Submission {
     /// Also accepts Verifying with settlement_target set — safety net if
     /// verification_callback partially committed before settle failed.
     pub fn retry_settlement(&mut self, job_id: String) {
-        let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
+        let escrow = self.escrows.get(&job_id).expect("Escrow not found");
         let valid = escrow.status == EscrowStatus::SettlementFailed
             || (escrow.status == EscrowStatus::Verifying && escrow.settlement_target.is_some());
         assert!(
@@ -1827,24 +898,6 @@ escrow.submissions.push(Submission {
             "Not retryable — must be SettlementFailed or Verifying with target"
         );
         assert!(escrow.settlement_target.is_some(), "No settlement target");
-
-        // Max retries — auto-cancel after threshold
-        escrow.retry_count += 1;
-        if escrow.retry_count > MAX_SETTLEMENT_RETRIES {
-            // Force cancel — FT contract may be permanently broken
-            escrow.status = EscrowStatus::Cancelled;
-            escrow.settlement_target = None;
-            self.escrows.insert(&job_id, &escrow);
-            // Refund storage deposit
-            Promise::new(escrow.agent.clone())
-                .transfer(NearToken::from_yoctonear(self.storage_deposit_yocto));
-            emit_event(
-                "settlement_max_retries_exceeded",
-                &serde_json::json!({"job_id": job_id, "retries": escrow.retry_count}),
-            );
-            return;
-        }
-        self.escrows.insert(&job_id, &escrow);
 
         // Owner can retry immediately; anyone else must wait until escrow expires
         let caller = env::predecessor_account_id();
@@ -1860,7 +913,6 @@ escrow.submissions.push(Submission {
             &serde_json::json!({
                 "job_id": job_id,
                 "caller": caller.to_string(),
-                "retry_count": escrow.retry_count,
             }),
         );
         self._settle_escrow(&job_id);
@@ -1979,18 +1031,19 @@ escrow.submissions.push(Submission {
     /// Frees storage. Callable by anyone — removing terminal state is always safe.
     /// Respects max_count to avoid gas limits on large cleanups.
     pub fn cleanup_completed(&mut self, max_count: u32) -> u32 {
-        if max_count == 0 {
-            return 0;
-        }
 
         let mut to_remove: Vec<String> = Vec::new();
-        let max = max_count as usize;
         for (jid, e) in self.escrows.iter() {
-            if matches!(e.status, EscrowStatus::Claimed | EscrowStatus::Refunded | EscrowStatus::Cancelled) {
-                to_remove.push(jid);
-                if to_remove.len() >= max {
-                    break;
+            match e.status {
+                EscrowStatus::Claimed
+                | EscrowStatus::Refunded
+                | EscrowStatus::Cancelled => {
+                    to_remove.push(jid);
+                    if to_remove.len() >= max_count as usize {
+                        break;
+                    }
                 }
+                _ => {}
             }
         }
 
@@ -2168,48 +1221,7 @@ escrow.submissions.push(Submission {
                 self._settle_escrow(&job_id);
             }
             EscrowStatus::Verifying => {
-                // Recovery path: allow refund of stuck Verifying escrows after the
-                // verification safety timeout has elapsed. This prevents escrows from
-                // being permanently stuck if the verifier service goes down AND the
-                // yield timeout callback never fires.
-                let safety_deadline = escrow.created_at + escrow.timeout_ms + VERIFICATION_SAFETY_TIMEOUT_MS;
-                assert!(
-                    now >= safety_deadline,
-                    "Cannot refund while verifying — safety timeout not met ({}ms remaining). Use force_cancel_verifying after timeout.",
-                    safety_deadline.saturating_sub(now)
-                );
-
-                // Refund worker stake — worker submitted in good faith, verification stalled
-                if let Some(stake) = escrow.worker_stake {
-                    if let Some(ref wpk) = escrow.worker_pubkey {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                        log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (expired Verifying recovery)", stake.0, wpk);
-                    } else if let Some(ref worker) = escrow.worker {
-                        Promise::new(worker.clone())
-                            .transfer(NearToken::from_yoctonear(stake.0));
-                        log!("Refunding worker stake: {} yoctoNEAR to {} (expired Verifying recovery)", stake.0, worker);
-                    }
-                }
-                escrow.worker_stake = None;
-
-                // Clean up data_id index entry
-                if let Some(ref did) = escrow.data_id {
-                    self.data_id_index.remove(&hex_encode(did.as_ref()));
-                }
-                escrow.data_id = None;
-                escrow.yield_consumed = false;
-
-                escrow.settlement_target = Some(SettlementTarget::FullRefund);
-                self.escrows.insert(&job_id, &escrow);
-                emit_event(
-                    "escrow_refunded_expired",
-                    &serde_json::json!({
-                        "job_id": job_id,
-                        "from_status": "Verifying",
-                        "reason": "verification_safety_timeout_expired",
-                    }),
-                );
-                self._settle_escrow(&job_id);
+                panic!("Cannot refund while verifying — yield timeout handles this");
             }
             EscrowStatus::SettlementFailed => {
                 // Settlement previously failed — retry it now that time has passed.
@@ -2314,20 +1326,14 @@ escrow.submissions.push(Submission {
             .collect()
     }
 
-    /// Paginated list of escrows in Verifying state — returns only minimal info for verifier routing.
+    /// List escrows in Verifying state — returns only minimal info for verifier routing.
     /// BLOCKER FIX: Only job_id, data_id, and status are returned. No task content,
     /// no worker submission content, no criteria — prevents pre-verification data leaks.
     /// The verifier service already has job details from the escrow_created/result_submitted events.
-    /// NOTE: O(n) scan over all escrows. Safe for <10K escrows with pagination caps.
-    /// For higher scale, use an offchain indexer.
-    pub fn list_verifying(&self, from_index: Option<u64>, limit: Option<u64>) -> Vec<serde_json::Value> {
-        let from = from_index.unwrap_or(0);
-        let max = limit.unwrap_or(50).min(100);
+    pub fn list_verifying(&self) -> Vec<serde_json::Value> {
         self.escrows
             .iter()
             .filter(|(_, e)| e.status == EscrowStatus::Verifying)
-            .skip(from as usize)
-            .take(max as usize)
             .map(|(_, e)| {
                 serde_json::json!({
                     "job_id": e.job_id,
@@ -2340,21 +1346,15 @@ escrow.submissions.push(Submission {
     }
 
     /// Returns aggregate escrow counts by status.
-    /// O(1) — returns cached counters updated on every state transition.
     pub fn get_stats(&self) -> serde_json::Value {
-        let s = &self.stats;
-        let mut by_status = std::collections::HashMap::new();
-        if s.pending_funding > 0 { by_status.insert("PendingFunding".to_string(), s.pending_funding); }
-        if s.open > 0 { by_status.insert("Open".to_string(), s.open); }
-        if s.in_progress > 0 { by_status.insert("InProgress".to_string(), s.in_progress); }
-        if s.verifying > 0 { by_status.insert("Verifying".to_string(), s.verifying); }
-        if s.claimed > 0 { by_status.insert("Claimed".to_string(), s.claimed); }
-        if s.refunded > 0 { by_status.insert("Refunded".to_string(), s.refunded); }
-        if s.cancelled > 0 { by_status.insert("Cancelled".to_string(), s.cancelled); }
-        if s.settlement_failed > 0 { by_status.insert("SettlementFailed".to_string(), s.settlement_failed); }
+        let mut counts = std::collections::HashMap::new();
+        for (_, e) in self.escrows.iter() {
+            let key = format!("{:?}", e.status);
+            *counts.entry(key).or_insert(0u64) += 1;
+        }
         serde_json::json!({
-            "total": s.total(),
-            "by_status": by_status,
+            "total": self.escrows.len(),
+            "by_status": counts,
         })
     }
 
@@ -2366,75 +1366,6 @@ escrow.submissions.push(Submission {
     /// Returns the required storage deposit in yoctoNEAR.
     pub fn get_storage_deposit(&self) -> U128 {
         U128(self.storage_deposit_yocto)
-    }
-
-    // ========================================
-    // Worker wallet views
-    // ========================================
-
-    /// Get a worker's internal balance for a specific token.
-    /// Returns 0 if worker or balance not found (not an error).
-    pub fn get_worker_balance(&self, worker_pubkey: String, token: Option<String>) -> U128 {
-        let token_str = match token {
-            Some(t) => t,
-            None => NEAR_TOKEN_ID.to_string(),
-        };
-        let key = balance_key(&worker_pubkey, &token_str);
-        self.balances.get(&key).unwrap_or(U128(0))
-    }
-
-    /// Get all balances for a worker across all tokens.
-    /// Returns array of {token, amount} objects.
-    pub fn get_worker_balances(&self, worker_pubkey: String) -> Vec<serde_json::Value> {
-        let prefix = format!("{}:", worker_pubkey);
-        self.balances
-            .iter()
-            .filter(|(k, _)| k.starts_with(&prefix))
-            .map(|(k, v)| {
-                let token = k.split(':').nth(1).unwrap_or("unknown").to_string();
-                serde_json::json!({ "token": token, "amount": v.0.to_string() })
-            })
-            .collect()
-    }
-
-    /// Get worker account info (linked NEAR account, nonce).
-    pub fn get_worker_info(&self, worker_pubkey: String) -> Option<WorkerAccountView> {
-        self.workers.get(&worker_pubkey).map(|w| w.into())
-    }
-
-    /// Check if a worker is paused.
-    pub fn is_worker_paused(&self, worker_pubkey: String) -> bool {
-        self.paused_workers.get(&worker_pubkey).is_some()
-    }
-
-    // ========================================
-    // Owner: admin — pause/unpause workers
-    // ========================================
-
-    /// Pause a worker — prevents claiming, submitting, and withdrawing.
-    /// Owner-only. Worker's balances are preserved (can unpause later).
-    pub fn pause_worker(&mut self, worker_pubkey: String) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        assert!(
-            self.workers.get(&worker_pubkey).is_some(),
-            "Worker not registered"
-        );
-        self.paused_workers.insert(&worker_pubkey, &true);
-        emit_event(
-            "worker_paused",
-            &serde_json::json!({ "worker_pubkey": worker_pubkey }),
-        );
-    }
-
-    /// Unpause a previously paused worker.
-    /// Owner-only.
-    pub fn unpause_worker(&mut self, worker_pubkey: String) {
-        assert_eq!(env::predecessor_account_id(), self.owner, "Only owner");
-        self.paused_workers.remove(&worker_pubkey);
-        emit_event(
-            "worker_unpaused",
-            &serde_json::json!({ "worker_pubkey": worker_pubkey }),
-        );
     }
 
     // ========================================

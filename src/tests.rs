@@ -1,5 +1,35 @@
 use near_sdk::test_utils::VMContextBuilder;
-use near_sdk::{testing_env, AccountId, NearToken};
+use near_sdk::{testing_env, AccountId, NearToken, GasWeight};
+
+// Stub yield host functions for native test compilation.
+// These are only needed so the linker doesn't fail — tests that exercise
+// yield/resume paths must run as integration tests against sandbox.
+#[cfg(test)]
+mod yield_stubs {
+    use std::ffi::c_ulong;
+
+    #[no_mangle]
+    pub extern "C" fn promise_yield_create(
+        _account_id: u64,
+        _method_name: u64,
+        _arguments: u64,
+        _amount: u128,
+        _gas: c_ulong,
+        _gas_weight: u64,
+        _data_id_register: u64,
+    ) -> u64 {
+        0u64 // promise index
+    }
+
+    #[no_mangle]
+    pub extern "C" fn promise_yield_resume(
+        _data_id: u64,
+        _payload: u64,
+        _payload_len: u64,
+    ) {
+        // no-op
+    }
+}
 
 fn alice() -> AccountId {
     "alice.near".parse().unwrap()
@@ -15,6 +45,20 @@ fn token_contract() -> AccountId {
 
 fn contract_account() -> AccountId {
     "escrow.near".parse().unwrap()
+}
+
+use crate::VerifierInfo;
+
+fn new_contract() -> super::EscrowContract {
+    super::EscrowContract::new(
+        vec![VerifierInfo {
+            account_id: "verifier.test.near".parse().unwrap(),
+            public_key: "a".repeat(64),
+            active: true,
+        }],
+        Some(1),
+        vec!["usdt.tether-token.near".parse().unwrap(), "token.near".parse().unwrap()],
+    )
 }
 
 fn one_near() -> NearToken {
@@ -38,7 +82,7 @@ fn setup() -> VMContextBuilder {
 fn create_funded_contract(context: &mut VMContextBuilder, job_id: &str) -> super::EscrowContract {
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
 
     contract.create_escrow(
         job_id.to_string(),
@@ -49,6 +93,8 @@ fn create_funded_contract(context: &mut VMContextBuilder, job_id: &str) -> super
         "Must have CRUD operations and tests".to_string(),
         Some(near_sdk::json_types::U128(100_000)),
         Some(80),
+        None,
+        None,
     );
 
     // Fund via ft_on_transfer
@@ -80,7 +126,7 @@ fn create_funded_contract(context: &mut VMContextBuilder, job_id: &str) -> super
 fn test_new_contract() {
     let context = setup();
     testing_env!(context.build());
-    let contract = super::EscrowContract::new();
+    let contract = new_contract();
     assert_eq!(contract.get_owner(), alice());
 }
 
@@ -91,7 +137,7 @@ fn test_create_escrow() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-1".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -101,6 +147,8 @@ fn test_create_escrow() {
         "Must have CRUD operations".to_string(),
         Some(near_sdk::json_types::U128(50_000)),
         Some(80),
+        None,
+        None,
     );
 
     let escrow = contract.get_escrow("job-1".to_string()).unwrap();
@@ -120,7 +168,7 @@ fn test_create_escrow_no_deposit() {
         .attached_deposit(NearToken::from_yoctonear(0))
         .build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-2".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -128,6 +176,8 @@ fn test_create_escrow_no_deposit() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -143,7 +193,7 @@ fn test_create_escrow_duplicate_id() {
         ))
         .build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
 
     contract.create_escrow(
         "job-dup".to_string(),
@@ -152,6 +202,8 @@ fn test_create_escrow_duplicate_id() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -165,6 +217,8 @@ fn test_create_escrow_duplicate_id() {
         "Criteria 2".to_string(),
         None,
         None,
+        None,
+        None,
     );
 }
 
@@ -174,7 +228,7 @@ fn test_create_escrow_fee_too_high() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-fee".to_string(),
         near_sdk::json_types::U128(100),
@@ -183,6 +237,8 @@ fn test_create_escrow_fee_too_high() {
         "Task".to_string(),
         "Criteria".to_string(),
         Some(near_sdk::json_types::U128(100)),
+        None,
+        None,
         None,
     );
 }
@@ -193,7 +249,7 @@ fn test_create_escrow_empty_criteria() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-no-criteria".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -201,6 +257,8 @@ fn test_create_escrow_empty_criteria() {
         24,
         "Task".to_string(),
         "".to_string(), // empty criteria
+        None,
+        None,
         None,
         None,
     );
@@ -213,7 +271,7 @@ fn test_ft_on_transfer_funding() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-ft".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -221,6 +279,8 @@ fn test_ft_on_transfer_funding() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -249,7 +309,7 @@ fn test_ft_on_transfer_wrong_sender_rejected() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-wrong".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -257,6 +317,8 @@ fn test_ft_on_transfer_wrong_sender_rejected() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -284,7 +346,7 @@ fn test_ft_on_transfer_wrong_amount_rejected() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-amt".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -292,6 +354,8 @@ fn test_ft_on_transfer_wrong_amount_rejected() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -383,7 +447,7 @@ fn test_cancel_pending_funding() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-cancel".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -391,6 +455,8 @@ fn test_cancel_pending_funding() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -412,7 +478,7 @@ fn test_cancel_wrong_caller() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-wrong-cancel".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -420,6 +486,8 @@ fn test_cancel_wrong_caller() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -441,7 +509,7 @@ fn test_get_stats() {
         .attached_deposit(NearToken::from_yoctonear(5_000_000_000_000_000_000_000_000))
         .build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
 
     contract.create_escrow(
         "stat-1".to_string(),
@@ -450,6 +518,8 @@ fn test_get_stats() {
         24,
         "Task 1".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -462,6 +532,8 @@ fn test_get_stats() {
         "Criteria".to_string(),
         None,
         None,
+        None,
+        None,
     );
 
     let stats = contract.get_stats();
@@ -472,7 +544,7 @@ fn test_get_stats() {
 fn test_get_storage_deposit() {
     let context = setup();
     testing_env!(context.build());
-    let contract = super::EscrowContract::new();
+    let contract = new_contract();
     let deposit = contract.get_storage_deposit();
     assert_eq!(deposit.0, 1_000_000_000_000_000_000_000_000); // 1 NEAR
 }
@@ -481,7 +553,7 @@ fn test_get_storage_deposit() {
 fn test_list_open_empty() {
     let context = setup();
     testing_env!(context.build());
-    let contract = super::EscrowContract::new();
+    let contract = new_contract();
     let open = contract.list_open(None, None);
     assert!(open.is_empty());
 }
@@ -489,7 +561,7 @@ fn test_list_open_empty() {
 // ─── Access control guards ────────────────────────────────────────
 
 #[test]
-#[should_panic(expected = "Only verifier can resume")]
+#[should_panic(expected = "Insufficient valid signatures")]
 fn test_resume_verification_wrong_caller() {
     let mut context = setup();
     let mut contract = create_funded_contract(&mut context, "job-guard1");
@@ -509,9 +581,12 @@ fn test_resume_verification_wrong_caller() {
         .attached_deposit(NearToken::from_yoctonear(0))
         .build());
     // data_id doesn't matter — the assert fires first
-    contract.resume_verification(
+    contract.resume_verification_multi(
         "0000000000000000000000000000000000000000000000000000000000000000".to_string(),
-        "{\"score\":100,\"passed\":true,\"detail\":\"hack\"}".to_string(),
+        crate::SignedVerdict {
+            verdict_json: "{\"score\":100,\"passed\":true,\"detail\":\"hack\"}".to_string(),
+            signatures: vec![],
+        },
     );
 }
 
@@ -540,7 +615,7 @@ fn test_list_by_status() {
         .attached_deposit(NearToken::from_yoctonear(2_000_000_000_000_000_000_000_000))
         .build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "s1".to_string(),
         near_sdk::json_types::U128(1000),
@@ -548,6 +623,8 @@ fn test_list_by_status() {
         24,
         "T1".to_string(),
         "C1".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -558,6 +635,8 @@ fn test_list_by_status() {
         24,
         "T2".to_string(),
         "C2".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -574,7 +653,7 @@ fn test_list_by_status() {
 fn test_list_by_status_invalid() {
     let context = setup();
     testing_env!(context.build());
-    let contract = super::EscrowContract::new();
+    let contract = new_contract();
     contract.list_by_status("NoSuchStatus".to_string(), None, None);
 }
 
@@ -586,7 +665,7 @@ fn test_create_escrow_job_id_too_long() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     let long_id = "x".repeat(200); // max is 128
     contract.create_escrow(
         long_id,
@@ -595,6 +674,8 @@ fn test_create_escrow_job_id_too_long() {
         24,
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -606,7 +687,7 @@ fn test_create_escrow_description_too_long() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-long-desc".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -614,6 +695,8 @@ fn test_create_escrow_description_too_long() {
         24,
         "x".repeat(3000), // max is 2048
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -625,7 +708,7 @@ fn test_create_escrow_criteria_too_long() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
 
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "job-long-crit".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -633,6 +716,8 @@ fn test_create_escrow_criteria_too_long() {
         24,
         "Task".to_string(),
         "x".repeat(3000), // max is 2048
+        None,
+        None,
         None,
         None,
     );
@@ -667,12 +752,13 @@ fn test_submit_result_too_long() {
 // ─── Full lifecycle integration test ─────────────────────────────
 
 #[test]
+#[ignore] // Requires NEAR sandbox — exercises promise_yield_create/resume
 fn test_full_lifecycle_create_fund_claim_submit() {
     let mut context = setup();
 
     // 1. Create escrow (agent = alice)
     testing_env!(context.attached_deposit(one_near()).build());
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
     contract.create_escrow(
         "lifecycle-1".to_string(),
         near_sdk::json_types::U128(1_000_000),
@@ -682,6 +768,8 @@ fn test_full_lifecycle_create_fund_claim_submit() {
         "Must have CRUD endpoints and tests".to_string(),
         Some(near_sdk::json_types::U128(100_000)),
         Some(80),
+        None,
+        None,
     );
 
     // Verify PendingFunding
@@ -749,6 +837,7 @@ fn test_full_lifecycle_create_fund_claim_submit() {
 // ─── State machine fixes ────────────────────────────────────────
 
 #[test]
+#[ignore] // Requires NEAR sandbox — exercises promise_yield_create/resume
 fn test_yield_timeout_refunds_worker_stake() {
     // Fix 1: Worker stake is refunded on yield timeout, not forfeited to agent.
     // We can't simulate yield timeout directly in unit tests (that's runtime behavior),
@@ -837,7 +926,7 @@ fn test_retry_settlement_owner_no_cooldown() {
 fn test_refund_expired_pending_funding() {
     let mut context = setup();
     testing_env!(context.attached_deposit(one_near()).build());
-    let mut contract = super::EscrowContract::new();
+    let mut contract = new_contract();
 
     contract.create_escrow(
         "job-expire-pf".to_string(),
@@ -846,6 +935,8 @@ fn test_refund_expired_pending_funding() {
         1, // 1 hour timeout
         "Task".to_string(),
         "Criteria".to_string(),
+        None,
+        None,
         None,
         None,
     );
@@ -881,3 +972,212 @@ fn test_refund_expired_open_status() {
     // Can't check status change (async settlement) but the call didn't panic
     // which confirms the Open → FullRefund path works
 }
+
+// ─── Worker wallet tests ──────────────────────────────────────────
+
+fn owner() -> AccountId {
+    "alice.near".parse().unwrap()
+}
+
+fn daemon() -> AccountId {
+    "daemon.near".parse().unwrap()
+}
+
+fn worker_pubkey() -> String {
+    // 64 hex chars (32 bytes) — just a test pubkey, doesn't need to be valid ed25519 for most tests
+    "a".repeat(64)
+}
+
+fn setup_as_owner() -> VMContextBuilder {
+    let mut context = setup();
+    testing_env!(context
+        .predecessor_account_id(owner())
+        .signer_account_id(owner())
+        .build());
+    context
+}
+
+#[test]
+fn test_register_worker_owner_only() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+
+    // Owner can register
+    contract.register_worker(worker_pubkey());
+    let info = contract.get_worker_info(worker_pubkey()).unwrap();
+    assert_eq!(info.nostr_pubkey, worker_pubkey());
+    assert_eq!(info.nonce, 0);
+}
+
+#[test]
+#[should_panic(expected = "Only owner can register workers")]
+fn test_register_worker_non_owner_rejected() {
+    let mut context = setup();
+    // new() sets owner = alice (signer at construction time)
+    testing_env!(context
+        .predecessor_account_id(owner())
+        .signer_account_id(owner())
+        .attached_deposit(one_near())
+        .build());
+    let mut contract = new_contract();
+
+    // Now switch to daemon — daemon is NOT the owner
+    testing_env!(context
+        .predecessor_account_id(daemon())
+        .signer_account_id(daemon())
+        .attached_deposit(NearToken::from_yoctonear(0))
+        .build());
+    contract.register_worker(worker_pubkey());
+}
+
+#[test]
+#[should_panic(expected = "Already registered")]
+fn test_register_worker_duplicate_rejected() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+    contract.register_worker(worker_pubkey());
+}
+
+#[test]
+fn test_deposit_to_worker() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    // Deposit 0.5 NEAR
+    testing_env!(context
+        .attached_deposit(NearToken::from_yoctonear(500_000_000_000_000_000_000_000))
+        .build());
+    contract.deposit_to_worker(worker_pubkey());
+
+    let bal = contract.get_worker_balance(worker_pubkey(), None);
+    assert_eq!(bal.0, 500_000_000_000_000_000_000_000);
+}
+
+#[test]
+#[should_panic(expected = "Must attach NEAR deposit")]
+fn test_deposit_to_worker_zero_rejected() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    testing_env!(context
+        .attached_deposit(NearToken::from_yoctonear(0))
+        .build());
+    contract.deposit_to_worker(worker_pubkey());
+}
+
+#[test]
+#[should_panic(expected = "Worker not registered")]
+fn test_deposit_to_unregistered_worker_rejected() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+
+    testing_env!(context
+        .attached_deposit(NearToken::from_yoctonear(500_000_000_000_000_000_000_000))
+        .build());
+    contract.deposit_to_worker(worker_pubkey());
+}
+
+#[test]
+fn test_get_worker_balance_default_zero() {
+    let context = setup();
+    let contract = new_contract();
+    let bal = contract.get_worker_balance("nonexistent".to_string(), None);
+    assert_eq!(bal.0, 0);
+}
+
+#[test]
+fn test_get_worker_balances_multiple_tokens() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    // Deposit NEAR
+    testing_env!(context
+        .attached_deposit(NearToken::from_yoctonear(500_000_000_000_000_000_000_000))
+        .build());
+    contract.deposit_to_worker(worker_pubkey());
+
+    // Check balances list
+    let balances = contract.get_worker_balances(worker_pubkey());
+    assert_eq!(balances.len(), 1);
+    assert_eq!(balances[0]["token"], "near");
+}
+
+#[test]
+fn test_pause_worker() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    // Not paused initially
+    assert!(!contract.is_worker_paused(worker_pubkey()));
+
+    // Owner pauses
+    contract.pause_worker(worker_pubkey());
+    assert!(contract.is_worker_paused(worker_pubkey()));
+}
+
+#[test]
+fn test_unpause_worker() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+    contract.pause_worker(worker_pubkey());
+    assert!(contract.is_worker_paused(worker_pubkey()));
+
+    contract.unpause_worker(worker_pubkey());
+    assert!(!contract.is_worker_paused(worker_pubkey()));
+}
+
+#[test]
+#[should_panic(expected = "Only owner")]
+fn test_pause_worker_non_owner_rejected() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    // Switch to daemon (non-owner) and try to pause
+    testing_env!(context
+        .predecessor_account_id(daemon())
+        .signer_account_id(daemon())
+        .build());
+    contract.pause_worker(worker_pubkey());
+}
+
+#[test]
+#[should_panic(expected = "Worker is paused")]
+fn test_deposit_to_paused_worker_rejected() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+    contract.pause_worker(worker_pubkey());
+
+    testing_env!(context
+        .predecessor_account_id(owner())
+        .attached_deposit(NearToken::from_yoctonear(500_000_000_000_000_000_000_000))
+        .build());
+    contract.deposit_to_worker(worker_pubkey());
+}
+
+#[test]
+fn test_worker_info_view() {
+    let mut context = setup_as_owner();
+    let mut contract = new_contract();
+    contract.register_worker(worker_pubkey());
+
+    let info = contract.get_worker_info(worker_pubkey()).unwrap();
+    assert_eq!(info.nostr_pubkey, worker_pubkey());
+    assert!(info.near_account_id.is_none());
+    assert_eq!(info.nonce, 0);
+}
+
+#[test]
+fn test_worker_info_nonexistent() {
+    let context = setup();
+    let contract = new_contract();
+    assert!(contract.get_worker_info("nonexistent".to_string()).is_none());
+}
+

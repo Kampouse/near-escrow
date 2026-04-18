@@ -1,0 +1,50 @@
+[package]
+name = "integration-tests"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+near-workspaces = "0.22"
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+anyhow = "1"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
+bs58 = "0.5"
+hex = "0.4"
+
+[[test]]
+name = "integration"
+path = "tests.rs"
+
+[[test]]
+name = "deploy-test"
+path = "deploy_test.rs"
+
+[[test]]
+name = "minimal-test"
+path = "minimal_test.rs"
+
+[[test]]
+name = "debug-test"
+path = "debug_test.rs"
+
+[[test]]
+name = "sequence-test"
+path = "sequence_test.rs"
+
+[[test]]
+name = "view-test"
+path = "view_test.rs"
+
+[[test]]
+name = "exec-test"
+path = "exec_test.rs"
+
+[[test]]
+name = "flow-b-test"
+path = "flow_b_test.rs"
+
+[[test]]
+name = "testnet-test"
+path = "testnet_test.rs"

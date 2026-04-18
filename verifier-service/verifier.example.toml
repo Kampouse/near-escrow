@@ -1,0 +1,30 @@
+# Escrow Verifier Service Configuration
+# Copy to verifier.toml and fill in your values
+
+# Your index in the escrow's verifier_set (0, 1, or 2)
+verifier_index = 0
+
+# ed25519 signing key (32 bytes hex) — MUST match the public key registered on-chain
+# Generate: openssl rand -hex 32
+secret_key_hex = "YOUR_SECRET_KEY_HEX"
+
+# Escrow contract account ID
+escrow_account = "escrow.your-account.testnet"
+
+# Network: "testnet" or "mainnet"
+network = "testnet"
+
+# NEAR RPC URL
+rpc_url = "https://test.rpc.fastnear.com"
+
+# Nostr relay for off-chain consensus
+nostr_relay = "wss://nostr-relay-production.up.railway.app"
+
+# LLM configuration
+llm_url = "https://api.openai.com/v1/chat/completions"
+llm_api_key = "sk-YOUR_OPENAI_KEY"
+llm_model = "gpt-4o-mini"
+
+# Must match escrow contract settings
+consensus_threshold = 2
+score_threshold = 50

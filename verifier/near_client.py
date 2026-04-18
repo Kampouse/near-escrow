@@ -53,25 +53,44 @@ class NearClient:
     # Event polling — scan recent blocks for result_submitted events
     # ------------------------------------------------------------------
 
-    def get_verifying_escrows(self) -> list[dict]:
+    def get_verifying_escrows(self, from_index: int = 0, limit: int = 100) -> list[dict]:
         """Fetch escrows in Verifying state directly from contract view.
 
-        Uses the list_verifying() view method which returns job_id + data_id + result.
-        No block scanning needed.
+        Uses the paginated list_verifying(from_index, limit) view method which
+        returns job_id + data_id + status. Automatically paginates to fetch all
+        verifying escrows. No block scanning needed.
         """
-        try:
-            result = self.provider.view_call(
-                self.contract_id,
-                "list_verifying",
-                b"",
-            )
-            if result.get("result"):
-                data = bytes(result["result"]).decode()
-                if data and data != "null":
-                    return json.loads(data)
-        except Exception as e:
-            log.warning("view_call list_verifying failed: %s", e)
-        return []
+        all_escrows: list[dict] = []
+        page_size = min(limit, 100)  # contract caps at 100
+        offset = from_index
+
+        while True:
+            try:
+                args = json.dumps({"from_index": offset, "limit": page_size}).encode()
+                result = self.provider.view_call(
+                    self.contract_id,
+                    "list_verifying",
+                    args,
+                )
+                if result.get("result"):
+                    data = bytes(result["result"]).decode()
+                    if data and data != "null":
+                        page = json.loads(data)
+                        if not page:
+                            break
+                        all_escrows.extend(page)
+                        if len(page) < page_size:
+                            break  # last page
+                        offset += len(page)
+                    else:
+                        break
+                else:
+                    break
+            except Exception as e:
+                log.warning("view_call list_verifying failed at offset %d: %s", offset, e)
+                break
+
+        return all_escrows
 
     # ------------------------------------------------------------------
     # Resume — deliver verdict to contract

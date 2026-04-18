@@ -1,2 +1,6 @@
 /target
 Cargo.lock
+verifier-service/target/
+tests/integration/verifier-mock/target/
+tests/integration/ft-mock/target/
+*.wasm

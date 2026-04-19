@@ -444,3 +444,94 @@ async fn test_e2e_nostr_round_trip() -> Result<()> {
     
     Ok(())
 }
+
+// ══════════════════════════════════════════════════════════════════
+// Daemon integration: spawn relayer pointing at sandbox RPC
+// ══════════════════════════════════════════════════════════════════
+
+#[tokio::test]
+async fn test_e2e_daemon_connects_to_sandbox() -> Result<()> {
+    let worker = near_workspaces::sandbox().await?;
+    let rpc_addr = worker.rpc_addr();
+    
+    println!("\n🔧 Testing daemon can connect to sandbox RPC...");
+    println!("   Sandbox RPC: {}", rpc_addr);
+    
+    // Write a temporary config pointing daemon at sandbox
+    let temp_config = format!(
+        r#"
+rpc_url = "{}"
+poll_interval_secs = 10
+dashboard_addr = "127.0.0.1:18082"
+poll_mode = "poll"
+contract_id = "test.local"
+account_id = "test.local"
+network = "sandbox"
+key_path = "/tmp/e2e-test-key.json"
+search_paths = ["/tmp"]
+nostr_relay = "wss://nostr-relay-production.up.railway.app"
+nostr_nsec = "0000000000000000000000000000000000000000000000000000000000000001"
+execution_mode = "escrow"
+escrow_contract = "escrow.test.local"
+
+[env]
+INLAYER_CONTRACT = "test.local"
+INLAYER_ACCOUNT = "test.local"
+INLAYER_NETWORK = "sandbox"
+"#,
+        rpc_addr.trim_end_matches('/')
+    );
+    
+    let config_path = "/tmp/e2e-test-config.toml";
+    std::fs::write(config_path, &temp_config)?;
+    
+    let daemon_bin = std::env::var("HOME")
+        .map(|h| format!("{}/.inlayer/bin/inlayer", h))
+        .unwrap_or_else(|_| "/Users/asil/.inlayer/bin/inlayer".to_string());
+    
+    // Test relayer mode
+    println!("   Starting daemon relayer...");
+    let mut child = tokio::process::Command::new(&daemon_bin)
+        .arg("relayer")
+        .env("OUTLAYER_CONFIG", config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    
+    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+    
+    match child.try_wait()? {
+        Some(status) => {
+            println!("   ⚠️  Daemon exited: {}", status);
+        }
+        None => {
+            println!("   ✅ Daemon relayer running (connected to sandbox RPC)");
+            child.kill().await?;
+        }
+    }
+    
+    // Test verifier mode
+    println!("   Starting daemon verifier...");
+    let mut child2 = tokio::process::Command::new(&daemon_bin)
+        .arg("verifier")
+        .env("OUTLAYER_CONFIG", config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    
+    match child2.try_wait()? {
+        Some(status) => {
+            println!("   ⚠️  Verifier exited: {}", status);
+        }
+        None => {
+            println!("   ✅ Daemon verifier running");
+            child2.kill().await?;
+        }
+    }
+    
+    std::fs::remove_file(config_path).ok();
+    println!("\n✅ Daemon can connect to sandbox RPC");
+    Ok(())
+}

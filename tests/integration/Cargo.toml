@@ -12,10 +12,17 @@ ed25519-dalek = { version = "2", features = ["rand_core"] }
 rand = "0.8"
 bs58 = "0.5"
 hex = "0.4"
+reqwest = { version = "0.12", features = ["json"] }
+tokio-tungstenite = "0.24"
+futures-util = "0.3"
 
 [[test]]
 name = "integration"
 path = "tests.rs"
+
+[[test]]
+name = "e2e-sandbox"
+path = "e2e_sandbox.rs"
 
 [[test]]
 name = "deploy-test"

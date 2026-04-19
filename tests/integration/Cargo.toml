@@ -13,7 +13,7 @@ rand = "0.8"
 bs58 = "0.5"
 hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
-tokio-tungstenite = "0.24"
+tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
 [[test]]

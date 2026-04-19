@@ -1,569 +1,174 @@
-# near-escrow
+# NEAR Escrow Marketplace
 
-Agent-to-agent task marketplace on NEAR Protocol. Agents post funded escrows, workers (each with their own msig) claim and complete tasks, an LLM verifier scores the work, and payment settles on-chain to the worker's msig.
+On-chain escrow protocol for AI agent task marketplace with Nostr-based off-chain coordination.
 
-Uses NEAR's yield/resume pattern for async LLM verification — the contract yields execution while the verifier scores off-chain, then resumes with the verdict.
-
-## Merged Architecture
-
-The escrow system merges with [near-inlayer](../near-inlayer/) for off-chain execution plumbing. The inlayer daemon is a dumb pipe — it routes tasks, relays worker-signed claim/submit actions via msig.execute(), and handles KV writes. But it **never does work**. Work is done by external AI agents (each with their own msig) that interact only via Nostr.
+## Architecture
 
 ```
-                          NEAR Protocol
-                    ┌─────────────────────────────────────────────────┐
-                    │                                                 │
-                    │  ┌──────────────┐    ┌──────────────────────┐   │
-                    │  │  Agent Msig  │    │   Escrow Contract    │   │
-                    │  │  (ed25519)   │    │                      │   │
-                    │  │              │    │  create_escrow()     │   │
-                    │  │  execute()◄──┤    │  claim()             │   │
-                    │  │  get_nonce() │    │  submit_result() ──► │   │
-                    │  └──────────────┘    │     YIELDS           │   │
-                    │          ▲           │       │              │   │
-                    │          │           │  verification_       │   │
-                    │          │           │  callback() ◄────────┤   │
-                    │          │           │       │              │   │
-                    │          │           │  settle_callback()   │   │
-                    │          │           └──────────────────────┘   │
-                    │          │                    ▲                 │
-                    │          │                    │                 │
-                    │          │           ┌────────┴──────────┐     │
-                    │          │           │  FT Contract      │     │
-                    │          │           │  (USDC/wNEAR)     │     │
-                    │          │           └───────────────────┘     │
-                    │          │                                     │
-                    └──────────┼─────────────────────────────────────┘
-                               │
-                    ┌──────────┴─────────────────────────────────────┐
-                    │            Inlayer Daemon (1 process)          │
-                    │          "Dumb pipes — routes, never works"    │
-                    │                                                │
-                    │  ┌──────────────┐  ┌─────────────────────────┐ │
-                    │  │  Relayer     │  │  Plumbing Thread        │ │
-                    │  │  Thread      │  │  (kind 41002 handler)  │ │
-                    │  │              │  │                         │ │
-                    │  │  Nostr 41000 │  │  Worker posts 41002     │ │
-                    │  │     │        │  │       │                 │ │
-                    │  │     ▼        │  │       ├── poll_until_open│ │
-                    │  │  msig.execute│  │       ├── worker_msig   │ │
-                    │  │     │        │  │       │   .execute()x2   │ │
-                    │  │     ▼        │  │       ├── write_kv()    │ │
-                    │  │  create+fund │  │       └── wait_settle   │ │
-                    │  │  →41004(FUNDED)│ │                         │ │
-                    │  └──────────────┘  │                         │ │
-                    │                    └─────────────────────────┘ │
-                    │  ┌──────────────┐                              │
-                    │  │  Verifier    │     FastNear KV              │
-                    │  │  Thread      │     ┌───────────┐           │
-                    │  │              │     │ kv.kampouse│           │
-                    │  │  poll        │     │  .near     │           │
-                    │  │  verifying ──┼──►  │           │           │
-                    │  │     │        │     │ result/   │           │
-                    │  │  Gemini API  │     │  {job_id} │           │
-                    │  │     │        │     └─────┬─────┘           │
-                    │  │  resume_     │           │                  │
-                    │  │  verification│◄──────────┘                  │
-                    │  └──────────────┘                              │
-                    │                                                │
-                    └────────────────────────────────────────────────┘
-                               ▲
-                               │ Nostr (kind 41000-41005)
-                    ┌──────────┴──────────────────┐
-                    │                             │
-                    │   Nostr Relay               │
-                    │   wss://nostr-relay-         │
-                    │   production.up.railway.app  │
-                    │                             │
-                    └─────────────────────────────┘
-                               ▲
-                    ┌──────────┴──────────────────┐
-                    │                             │
-                    │   Task Agent (posts 41000)  │
-                    │   ed25519 + secp256k1 keys  │
-                    │   inlayer post-task ...      │
-                    │                             │
-                    └─────────────────────────────┘
-                               ▲
-                    ┌──────────┴──────────────────┐
-                    │                             │
-                    │   Worker Agent (has msig)    │
-                    │   External AI — does the     │
-                    │   actual work, signs claim   │
-                    │   + submit via own msig,     │
-                    │   posts 41002 to Nostr       │
-                    │                             │
-                    └─────────────────────────────┘
+Agent (posts task)          Worker (does work)         Verifier (scores)
+     │                            │                          │
+     ├─ kind 41000 ──► Nostr ────┤                          │
+     │                  Relay     │                          │
+     │                            ├─ kind 41002 ──► Nostr    │
+     │                            │                  Relay   │
+     │                            │                          │
+     ▼                            ▼                          ▼
+  Relayer ◄──────────────────── Daemon ◄─────────────── Verifier
+  (Python)                      (Rust)                 (Python/Gemini)
+     │                            │                          │
+     └── msig.execute() ──► NEAR Escrow Contract ◄──────────┘
+                              (state machine)
 ```
 
-## Repositories
+## Contracts
 
-| Repo | Path | Purpose |
-|------|------|---------|
-| [near-escrow](./) | `near-escrow/` | Escrow + msig contracts, Python tools |
-| [near-inlayer](../near-inlayer/) | `near-inlayer/` | Offchain daemon, Nostr routing, escrow plumbing |
-
-## System Links
-
-| Service | URL | Purpose |
-|---------|-----|---------|
-| NEAR Testnet RPC | `https://rpc.testnet.near.org` | JSON-RPC endpoint |
-| NEAR Mainnet RPC | `https://rpc.mainnet.near.org` | JSON-RPC endpoint |
-| FastNear KV | `https://kv.main.fastnear.com/v0/latest/{account}/{predecessor}/{key}` | Read KV data |
-| FastNear KV Write | RPC `__fastdata_kv` to any account | Write KV via transaction |
-| NEAR Explorer (Testnet) | `https://testnet.nearblocks.io` | Block/tx explorer |
-| NEAR Explorer (Mainnet) | `https://nearblocks.io` | Block/tx explorer |
-| Nostr Relay | `wss://nostr-relay-production.up.railway.app` | Event discovery |
-| Gemini API | `https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash` | LLM scoring |
-| NEARFS | `https://ipfs.web4.near.page/ipfs/{cid}` | IPFS-compatible storage on NEAR |
-
-## Nostr Event Kinds
-
-| Kind | Name | Direction | Description |
-|------|------|-----------|-------------|
-| 41000 | TASK | Task Agent → Network | New task with create_escrow + fund_escrow actions |
-| 41001 | CLAIM | Daemon (plumbing) → Network | Daemon claimed the job on-chain |
-| 41002 | RESULT | Worker Agent (has own msig) → Network | External AI agent posted work result + signed claim/submit actions |
-| 41003 | ACTION | Task Agent → Network | Generic msig action (cancel, withdraw, rotate) |
-| 41004 | DISPATCHED | Daemon (relayer) → Network | Escrow created + funded on-chain (FUNDED signal to workers) |
-| 41005 | CONFIRMED | Network → Agents | Settlement confirmed on-chain |
-
-Legacy kinds (7200-7205) supported for backwards compatibility.
-
-## Nostr ↔ Contract Flow
-
-Every escrow action goes through Nostr. The contract never talks to Nostr directly — the daemon bridges them.
-
-```
-TASK AGENT                     NOSTR                          DAEMON                         NEAR ON-CHAIN
-  │                              │                              │                               │
-  │  1. Sign CreateEscrow        │                              │                               │
-  │     + FundEscrow with        │                              │                               │
-  │     ed25519 key              │                              │                               │
-  │                              │                              │                               │
-  │  2. POST kind 41000 ────────►│                              │                               │
-  │     tags: action, action_sig,│                              │                               │
-  │     fund_action,             │                              │                               │
-  │     fund_action_sig,         │                              │                               │
-  │     agent (msig address),    │                              │                               │
-  │     description, reward      │                              │                               │
-  │                              │  3. Relayer thread ─────────►│                               │
-  │                              │     subscribes to 41000      │                               │
-  │                              │                              │                               │
-  │                              │                              │  4. Extract signed actions    │
-  │                              │                              │     + msig address from tags  │
-  │                              │                              │                               │
-  │                              │                              │  5. msig.execute() ──────────►│
-  │                              │                              │     (action_json + sig)       │
-  │                              │                              │                               │
-  │                              │                              │                    ┌──────────┤
-  │                              │                              │                    │ msig     │
-  │                              │                              │                    │ verifies │
-  │                              │                              │                    │ sig+nonce│
-  │                              │                              │                    └────┬─────┤
-  │                              │                              │                         │     │
-  │                              │                              │         create_escrow() ├────►│ PendingFunding
-  │                              │                              │         fund_escrow()   ├────►│ Open
-  │                              │                              │                               │
-
-WORKER AGENT (has own msig)      │                              │                               │
-  │                              │                              │                               │
-  │  6. See kind 41000 ◄────────│                              │                               │
-  │     (task available)         │                              │                               │
-  │                              │                              │                               │
-  │                              │  6b. POST kind 41004 ◄──────│                               │
-  │                              │      (FUNDED — escrow Open) │                               │
-  │                              │                              │                               │
-  │  7. See 41004 → escrow is    │                              │                               │
-  │     funded → safe to claim   │                              │                               │
-  │                              │                              │                               │
-  │  8. Do actual work (off-chain│                              │                               │
-  │     — this is NOT the daemon)│                              │                               │
-  │                              │                              │                               │
-  │  9. Pre-sign claim() and     │                              │                               │
-  │     submit_result() with     │                              │                               │
-  │     worker msig key          │                              │                               │
-  │                              │                              │                               │
-  │  10. POST kind 41002 ───────►│                              │                               │
-  │     tags: job_id, result,    │                              │                               │
-  │     worker_msig,             │                              │                               │
-  │     claim_action, claim_sig, │                              │                               │
-  │     submit_action,submit_sig │                              │                               │
-  │                              │                              │                               │
-  │                              │  11. Plumbing thread ──────►│                               │
-  │                              │     sees 41002               │                               │
-  │                              │                              │                               │
-  │                              │                              │  12. worker_msig.execute()──►│ InProgress
-  │                              │                              │      (claim via worker msig) │ worker stakes own funds
-  │                              │                              │                               │
-  │                              │  13. POST kind 41001 ◄──────│                               │
-  │                              │      (claim notification)   │                               │
-  │                              │                              │                               │
-  │                              │                              │  14. Write result to          │
-  │                              │                              │      FastNear KV via RPC ────►│ KV stored
-  │                              │                              │      (daemon signer)          │
-  │                              │                              │                               │
-  │                              │                              │  15. worker_msig.execute()──►│ Verifying
-  │                              │                              │      (submit_result via       │ (YIELDS)
-  │                              │                              │       worker msig)            │
-  │                              │                              │                               │
-  │                              │  16. POST kind 41002 ◄──────│                               │
-  │                              │      (result notification)  │                               │
-  │                              │                              │                               │
-  │                              │                              │  ─── ~200 block timeout ──── │
-  │                              │                              │                               │
-  │                              │                              │  17. Verifier thread          │
-  │                              │                              │      polls list_verifying() ─►│
-  │                              │                              │                               │
-  │                              │                              │  18. Fetch result from        │
-  │                              │                              │      FastNear KV (HTTP GET)   │
-  │                              │                              │                               │
-  │                              │                              │  19. Score via Gemini API     │
-  │                              │                              │      (4 passes, median)       │
-  │                              │                              │                               │
-  │                              │                              │  20. resume_verification() ──►│
-  │                              │                              │      {score, passed}          │
-  │                              │                              │                               │
-  │                              │                              │                    ┌──────────┤
-  │                              │                              │                    │ contract │
-  │                              │                              │                    │ resumes  │
-  │                              │                              │                    │ yield    │
-  │                              │                              │                    └────┬─────┤
-  │                              │                              │                         │     │
-  │                              │                              │       settlement_callback├────►│
-  │                              │                              │                         │     │
-  │                              │                              │       ft_transfer(worker_msig)├─►│ worker paid
-  │                              │                              │       ft_transfer(verifier)├──►│ verifier fee
-  │                              │                              │                               │
-  │                              │  21. POST kind 41005 ◄──────│                               │
-  │                              │      (settlement confirmed) │                               │
-  │                              │                              │                               │
-  │  22. See 41005 ◄────────────│                              │                               │
-  │     (worker notified)        │                              │                               │
-```
-
-### Event Tags Reference
-
-**Kind 41000 (TASK):**
-```json
-{
-  "kind": 41000,
-  "content": "Summarize this article about NEAR Protocol",
-  "tags": [
-    ["action", "{\"CreateEscrow\":{...}}"],
-    ["action_sig", "<64-byte hex ed25519 signature>"],
-    ["fund_action", "{\"FundEscrow\":{\"job_id\":\"task-001\",\"amount\":\"1000000\"}}"],
-    ["fund_action_sig", "<64-byte hex ed25519 signature>"],
-    ["agent", "<msig_account_id>"],
-    ["description", "Summarize this article"],
-    ["reward", "1 USDC"]
-  ]
-}
-```
-
-**Kind 41003 (ACTION) — cancel, withdraw, rotate:**
-```json
-{
-  "kind": 41003,
-  "content": "",
-  "tags": [
-    ["action", "{\"CancelEscrow\":{\"job_id\":\"task-001\"}}"],
-    ["action_sig", "<64-byte hex>"],
-    ["agent", "<msig_account_id>"]
-  ]
-}
-```
-
-## Escrow Flow
-
-```
-1. Task Agent signs CreateEscrow + FundEscrow → posts kind 41000 (TASK) to Nostr
-2. Daemon relayer thread sees 41000 → calls msig.execute() on-chain
-   ├── create_escrow()  → escrow created (PendingFunding)
-   └── fund_escrow()    → escrow funded (Open)
-3. Daemon publishes kind 41004 (FUNDED) → signals workers that escrow is ready
-4. Worker agent (has own msig) sees 41004 → does the actual work
-5. Worker pre-signs claim() + submit_result() with own msig key
-6. Worker posts kind 41002 (RESULT) to Nostr with {job_id, result, worker_msig, claim_action, claim_sig, submit_action, submit_sig}
-7. Daemon plumbing thread sees 41002 → runs the on-chain lifecycle:
-   ├── worker_msig.execute() → claim via worker's msig (worker stakes own funds) (InProgress)
-   ├── write_kv()            → store result in FastNear KV (daemon signer)
-   └── worker_msig.execute() → submit_result via worker's msig → YIELDS (Verifying)
-8. Daemon verifier thread polls list_verifying()
-   ├── Fetches result from FastNear KV HTTP
-   ├── Scores via Gemini API
-   └── Calls resume_verification() → settlement_callback()
-9. Settlement: worker's msig paid OR agent refunded
-10. Daemon posts kind 41005 (CONFIRMED) to Nostr
-```
-
-## Escrow State Machine
-
-```
-PendingFunding → Open → InProgress → Verifying → Claimed
-     ↓              ↓                              ↓
-  Cancelled     Cancelled                      Refunded
-                                                  ↓
-                                          SettlementFailed → (retry)
-```
-
-## Settlement Logic
-
-- **Passed** (score ≥ threshold): worker gets `amount - verifier_fee`, verifier gets `fee`
-- **Failed** (score < threshold): agent refunded `amount - verifier_fee`, verifier gets `fee`
-- **Timeout** (~200 blocks): full refund to agent, no verifier fee
-- **SettlementFailed**: owner retries via `retry_settlement()`
-
-Settlement uses `.and()` to batch FT transfers in parallel, then manually checks all promise results. No `#[callback_result]` or `#[callback_vec]` — both are insufficient for joint promises (see PLAN.md for the full bug history).
-
-## Identity Model
-
-Each agent has two keys:
-
-| Key | Curve | Purpose |
-|-----|-------|---------|
-| Nostr key | secp256k1 | Identity on Nostr (nsec/npub) |
-| Auth key | ed25519 | Signs msig actions (NEAR native) |
-
-No cross-curve derivation. The msig IS the agent's NEAR wallet — it holds the ed25519 pubkey and verifies every action.
-
-## Agent Multisig (agent-msig)
-
-The msig holds the agent's ed25519 public key. Every action requires a valid ed25519 signature + sequential nonce. The relayer submits but cannot forge actions.
-
-**Actions:** CreateEscrow, FundEscrow, CancelEscrow, RegisterToken, RotateKey, Withdraw
-
-**Key management:**
-- Normal rotation: agent signs RotateKey with old key
-- Emergency rotation: contract owner calls force_rotate after 24h cooldown
-
-**Security:**
-- Relayer can only censor, not forge or steal
-- Nonce prevents replay
-- Owner can't execute actions or move funds — only force-rotate after cooldown
-
-## Repository Structure
-
-```
-near-escrow/
-├── src/lib.rs              # Escrow contract (yield/resume verification)
-├── src/tests.rs            # Escrow tests (15 passing)
-├── agent-msig/
-│   ├── src/lib.rs          # Msig contract (16 tests passing)
-│   └── Cargo.toml
-├── verifier/               # Python verifier (standalone, or daemon thread)
-│   ├── main.py             # Poll list_verifying(), score with Gemini
-│   ├── scorer.py           # 4 independent passes, median aggregation
-│   └── near_client.py      # NEAR RPC client
-├── nostr/                  # Python Nostr tools (standalone)
-│   ├── relayer.py          # Nostr → on-chain bridge
-│   ├── worker.py           # Claims tasks, submits results
-│   ├── post_task.py        # CLI to post tasks
-│   └── event_schema.json   # Kind definitions
-├── MERGED-PLAN.md          # Merged architecture plan
-├── PLAN.md                 # Full project plan + bug history
-└── README.md
-
-near-inlayer/
-├── contract/               # Job-queue contract (~650 lines)
-├── worker/
-│   ├── src/
-│   │   ├── bin/inlayer.rs  # CLI entry point (post-task, relayer, verifier, daemon)
-│   │   └── daemon/
-│   │       ├── mod.rs              # Daemon main loop + event routing
-│   │       ├── escrow_client.rs    # claim, claim_via_msig, submit_result, submit_result_via_msig, write_kv, run_escrow_job
-│   │       ├── escrow_commands.rs  # CLI subcommands + daemon thread spawners
-│   │       ├── nostr.rs            # Nostr pub/sub (kind 41000-41005)
-│   │       ├── manage.rs           # DaemonConfig (execution_mode, escrow fields)
-│   │       └── nonce.rs            # NonceCache for tx sequencing
-│   └── Cargo.toml
-└── examples/               # WASI P2 example programs
-```
-
-## Build
-
-```bash
-# Escrow + msig contracts
-cd near-escrow && cargo build --target wasm32-unknown-unknown --release
-
-# Inlayer daemon
-cd near-inlayer/worker && cargo build --release --bin inlayer
-```
-
-## Test
-
-```bash
-# Escrow (15 tests)
-cd near-escrow && cargo test
-
-# Msig (16 tests)
-cd near-escrow && cargo test -p agent-msig
-
-# Inlayer (17 tests)
-cd near-inlayer/worker && cargo test
-
-# All escrow workspace
-cd near-escrow && cargo test --workspace
-```
-
-## Running the Daemon
-
-### Configuration (`inlayer.config`)
-
-```toml
-# Core
-contract_id = "inlayer.testnet"
-account_id = "daemon.testnet"
-key_path = "~/.near-credentials/testnet/daemon.testnet.json"
-
-# RPC
-rpc_url = "https://rpc.testnet.near.org"
-
-# Nostr signaling
-nostr_relay = "wss://nostr-relay-production.up.railway.app"
-nostr_nsec = "nsec1..."
-
-# Execution mode: "direct" (inlayer only) | "escrow" | "both"
-execution_mode = "escrow"
-
-# Escrow (required for escrow/both mode)
-escrow_contract = "escrow.kampouse.testnet"
-kv_account = "kv.kampouse.near"
-worker_stake_yocto = 1000000000000000000000000  # 1 NEAR
-
-# Timing
-escrow_fund_timeout_secs = 60
-escrow_settle_timeout_secs = 120
-```
-
-### Environment Variables
-
-| Variable | Required | Purpose |
+| Contract | Location | Purpose |
 |----------|----------|---------|
-| `GEMINI_API_KEY` | Escrow mode | LLM scoring for verifier thread |
-| `NEAR_PRIVATE_KEY` | Alternative | If key_path not set in config |
-| `INLAYER_NETWORK` | Optional | testnet/mainnet |
-| `INLAYER_ACCOUNT` | Optional | Override account_id |
-| `INLAYER_CONTRACT` | Optional | Override contract_id |
+| **Escrow** | `src/` | Payment arbiter, state machine, verification |
+| **Agent Msig** | `agent-msig/` | Ed25519 + Nostr auth, spending limits |
+| **Clear Msig** | `../nostr-msig/` | Schnorr governance multisig |
 
-### Starting
+## Escrow Lifecycle
 
-```bash
-# Build
-cd near-inlayer/worker && cargo build --release --bin inlayer
-
-# Initialize config
-./target/release/inlayer init
-
-# Run in foreground (development)
-./target/release/inlayer daemon --foreground
-
-# Run as daemon (production)
-./target/release/inlayer daemon --start
-
-# With dashboard
-./target/release/inlayer daemon --foreground --dashboard 127.0.0.1:8082
-
-# Post a task
-./target/release/inlayer post-task \
-  --nostr-key nsec1... \
-  --agent-key ed25519:... \
-  --msig agent-msig.testnet \
-  --escrow escrow.kampouse.testnet \
-  --job-id task-001 \
-  --description "Summarize this article" \
-  --reward "1" \
-  --rpc https://rpc.testnet.near.org
-
-# Standalone relayer (for debugging)
-./target/release/inlayer relayer --dry-run
-
-# Standalone verifier (for debugging)
-./target/release/inlayer verifier --once
+```
+PendingFunding → Open → InProgress → Verifying → Claimed (worker paid)
+                                        ↘ Refunded (agent refund)
 ```
 
-When `execution_mode = "escrow"` or `"both"`, the daemon automatically spawns relayer and verifier threads. No need to run separate processes.
+1. **Create** — Agent creates escrow with task description, criteria, reward
+2. **Fund** — FT tokens deposited via `ft_transfer_call` or `FundEscrow`
+3. **Claim** — Worker stakes and claims the task
+4. **Submit** — Worker submits result (optionally stored in FastNear KV)
+5. **Verify** — Verifier scores output with LLM (multi-verifier consensus supported)
+6. **Settle** — Pass: worker paid. Fail: agent refunded.
 
-## Escrow Contract Methods
+## Quick Start
 
-### State-changing
-
-| Method | Who | Description |
-|--------|-----|-------------|
-| `create_escrow` | Agent | Create escrow in PendingFunding state (1 NEAR deposit) |
-| `claim` | Worker | Claim an open escrow (cannot be agent) |
-| `submit_result` | Worker | Submit work result, triggers yield for verification |
-| `verification_callback` | Runtime | Called on yield resume with verifier verdict |
-| `settle_callback` | Runtime | Called after FT transfer chain completes |
-| `cancel` | Agent | Cancel before worker claims (PendingFunding or Open) |
-| `refund_expired` | Anyone | Refund after timeout (blocked during Verifying) |
-| `retry_settlement` | Owner | Retry a failed FT settlement |
-
-### Read-only (views)
-
-| Method | Description |
-|--------|-------------|
-| `get_escrow(job_id)` | Get escrow details |
-| `list_open(from_index, limit)` | Paginated open escrows |
-| `list_verifying(from_index, limit)` | Paginated verifying escrows |
-| `list_by_agent(agent, from_index, limit)` | Paginated escrows by agent |
-| `list_by_worker(worker, from_index, limit)` | Paginated escrows by worker |
-| `get_stats()` | Total escrows by status |
-| `get_owner()` | Contract owner |
-| `get_storage_deposit()` | Required storage deposit (1 NEAR) |
-
-## Msig Contract Methods
-
-### State-changing
-
-| Method | Who | Description |
-|--------|-----|-------------|
-| `execute(action_json, signature)` | Relayer | Verify ed25519 sig + nonce, dispatch action |
-| `ft_on_transfer` | FT contract | Accept all incoming FT tokens |
-| `force_rotate(new_pubkey, new_npub)` | Owner | Emergency key rotation after 24h cooldown |
-
-### Read-only (views)
-
-| Method | Description |
-|--------|-------------|
-| `get_agent_pubkey()` | Current ed25519 pubkey |
-| `get_agent_npub()` | Nostr public key (identity) |
-| `get_nonce()` | Current nonce (next action = this + 1) |
-| `get_escrow_contract()` | Escrow contract address |
-| `get_last_action_block()` | Block height of last action (cooldown calc) |
-| `get_owner()` | Emergency admin |
-
-## Funding (Two-Step)
-
-Escrow uses two-step funding to prevent stuck FT tokens:
+### Build
 
 ```bash
-# Step 1: Create escrow (unfunded) — via msig or directly
-near call escrow.kampouse.testnet create_escrow '{}' --deposit 1
+# Escrow contract
+cargo build --release --target wasm32-unknown-unknown
 
-# Step 2: Fund via ft_transfer_call
-near call usdc.fakes.testnet ft_transfer_call '{
-  "receiver_id": "escrow.kampouse.testnet",
-  "amount": "1000000",
-  "msg": "task-001"
-}' --deposit 1 --gas 45000000000000
+# Agent msig
+cargo build --release --target wasm32-unknown-unknown -p agent-msig
+
+# Optimized WASM (requires wasm-opt)
+bash ../nostr-msig/build.sh
 ```
 
-## Key Design Decisions
+### Deploy (testnet)
 
-- Verifier is OFF-CHAIN LLM service, not WASM
-- yield/resume for async verification (~200 block timeout)
-- Verifier gets paid even on failure (scoring costs compute)
-- No verifier allowlist — anyone can call resume_verification (off-chain trust)
-- Nostr is discovery only — contracts don't know about it
-- Two-phase funding prevents stuck FT tokens
-- Score consistency enforced on-chain (can't fake passed with low score)
-- Settlement uses manual promise result iteration (not annotations)
-- retry_settlement is the universal recovery path
-- Msig stores raw 32-byte pubkey (not PublicKey struct) — direct ed25519_verify
-- Daemon is dumb pipe — routes tasks, relays worker-signed actions via msig.execute(), handles KV writes
-- One process runs relayer + plumbing + verifier (thread-based, not separate processes)
-- FastNear KV for large results — small KV reference on-chain, full data off-chain
+```bash
+near contract deploy <account> use-file target/wasm32-unknown-unknown/release/near_escrow.wasm \
+  without-init-call network-config testnet sign-with-access-key-file <key.json> send
 
-## License
+near contract call-function as-transaction <account> new json-args '{
+  "verifier_set": [{"account_id": "verifier.test.near", "public_key": "<hex>", "active": true}],
+  "consensus_threshold": 1,
+  "allowed_tokens": []
+}' prepaid-gas '30 Tgas' attached-deposit '0 NEAR' sign-as <account> \
+  network-config testnet sign-with-access-key-file <key.json> send
+```
 
-MIT
+## Testing
+
+### Unit / Sandbox Tests (95 tests)
+
+```bash
+# All integration tests
+cargo test -p integration-tests
+
+# E2E sandbox tests
+cargo test -p integration-tests --test e2e-sandbox
+
+# Specific test
+cargo test -p integration-tests --test integration -- test_full_happy_path
+```
+
+### E2E Tests (6 tests)
+
+Full local loop: sandbox + daemon + Nostr relay, no testnet needed.
+
+```bash
+cargo test -p integration-tests --test e2e-sandbox
+```
+
+| Test | What it proves |
+|------|---------------|
+| `test_e2e_happy_path` | Full escrow lifecycle on sandbox — worker gets paid |
+| `test_e2e_verification_failure` | Verification fails → agent refunded |
+| `test_e2e_rpc_endpoint_exposed` | Sandbox exposes real HTTP JSON-RPC |
+| `test_e2e_nostr_round_trip` | Kind 41000 event reaches real Nostr relay |
+| `test_e2e_daemon_connects_to_sandbox` | Daemon relayer connects to sandbox RPC |
+| `test_e2e_full_local_daemon_flow` | **Full loop: Nostr → Daemon → Sandbox** |
+
+### Test Coverage
+
+**95 sandbox tests** covering every public method:
+
+- Create/fund/claim/submit/verify/settle flows
+- Worker registration, linking, pause/unpause, withdrawal (NEAR + FT)
+- Owner transfer, pause/unpause, storage deposit config
+- Multi-verifier consensus (2-of-3 threshold)
+- FT funding via `ft_transfer_call`
+- Admin: verifier management, token allowlist, consensus threshold
+- Views: list_by_status, list_by_agent, list_by_worker, get_stats
+
+**150 daemon tests** in `near-inlayer/worker/`
+
+### Known Sandbox Limitations
+
+2 tests are `#[ignore]` due to sandbox constraints:
+
+- `test_force_cancel_verifying` — needs 172k blocks (48h) for safety timeout
+- `test_flow_b_full_lifecycle` — sandbox nonce race (view/mutation see different state)
+
+Both should work on testnet/mainnet where time passes naturally.
+
+## Nostr Event Schema
+
+| Kind | Name | Direction |
+|------|------|-----------|
+| 41000 | TaskPosted | Agent → Network |
+| 41001 | TaskUpdated | Agent → Network |
+| 41002 | ResultSubmitted | Worker → Network |
+| 41003 | TaskFunded | Agent → Network |
+| 41004 | TaskDispatched | Relayer → Network |
+| 41005 | TaskConfirmed | Daemon → Network |
+
+## Off-Chain Services
+
+| Service | Language | Location |
+|---------|----------|----------|
+| Relayer | Python | `nostr/relayer.py` |
+| Verifier | Python + Gemini | `verifier/` |
+| Daemon | Rust | `../near-inlayer/worker/` |
+
+### Relayer
+
+Watches Nostr for kind 41000 events, submits CreateEscrow + FundEscrow via msig.execute(), publishes kind 41004.
+
+### Verifier
+
+Polls escrow for Verifying status, fetches results from FastNear KV, scores with Gemini, settles on-chain.
+
+### Daemon
+
+Rust binary with escrow client, relayer mode, verifier mode, supervisor. Dual-mode config (`direct` / `escrow` / `both`).
+
+## Security Features
+
+- **Reentrancy guard** — locked flag prevents re-entry during cross-contract calls
+- **Emergency pause** — owner can pause all state-changing operations
+- **Spending limits** — per-action and daily limits on agent msig
+- **Worker stake** — workers must stake to claim tasks
+- **Multi-verifier consensus** — configurable threshold (e.g., 2-of-3)
+- **Proposal expiry** — expired proposals can't be executed
+- **Force cancel** — owner can cancel stuck verifications after safety timeout
+
+## Related
+
+- [nostr-msig](../nostr-msig/) — Schnorr governance multisig (clear-msig)
+- [near-inlayer](../near-inlayer/) — Daemon with escrow integration
+- [PLAN.md](../PLAN.md) — Full integration plan

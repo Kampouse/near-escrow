@@ -9,11 +9,19 @@ Handles:
 import json
 import logging
 from typing import Optional
+from urllib.request import urlopen, Request
+from urllib.error import URLError
 
 from near_api.account import Account
 from near_api.providers import JsonProvider
 
 log = logging.getLogger(__name__)
+
+# FastNear KV endpoints
+KV_URLS = {
+    "testnet": "https://kv.testnet.fastnear.com/v0/latest/{account}/{predecessor}/{key}",
+    "mainnet": "https://kv.main.fastnear.com/v0/latest/{account}/{predecessor}/{key}",
+}
 
 
 class NearClient:
@@ -123,6 +131,90 @@ class NearClient:
             amount=0,
         )
 
+        return result
+
+    # ------------------------------------------------------------------
+    # FastNear KV — fetch work results
+    # ------------------------------------------------------------------
+
+    def fetch_kv_result(self, kv_reference: str, network: str = "testnet") -> Optional[str]:
+        """Fetch work result from FastNear KV storage.
+
+        Args:
+            kv_reference: JSON string like {"kv_account":"...", "kv_predecessor":"...", "kv_key":"..."}
+                          or a plain URL string.
+            network: "testnet" or "mainnet" (used for URL template if kv_reference is JSON)
+
+        Returns:
+            The result text, or None on failure.
+        """
+        # Try parsing as JSON reference
+        try:
+            ref = json.loads(kv_reference) if isinstance(kv_reference, str) else kv_reference
+            kv_account = ref.get("kv_account", "")
+            kv_predecessor = ref.get("kv_predecessor", "")
+            kv_key = ref.get("kv_key", "")
+
+            if not all([kv_account, kv_predecessor, kv_key]):
+                log.warning("Incomplete kv_reference: %s", kv_reference)
+                return None
+
+            url_template = KV_URLS.get(network, KV_URLS["testnet"])
+            url = url_template.format(
+                account=kv_account,
+                predecessor=kv_predecessor,
+                key=kv_key,
+            )
+        except (json.JSONDecodeError, AttributeError):
+            # Maybe it's a plain URL
+            if kv_reference.startswith("http"):
+                url = kv_reference
+            else:
+                log.warning("Cannot parse kv_reference: %s", kv_reference)
+                return None
+
+        try:
+            req = Request(url, headers={"Accept": "application/json"})
+            with urlopen(req, timeout=10) as resp:
+                data = json.loads(resp.read().decode())
+                # FastNear KV returns the value directly
+                # It might be nested under "value" or just the raw data
+                if isinstance(data, dict):
+                    # Could be {"value": "..."} or the actual result
+                    result = data.get("value", data.get("result"))
+                    if result is not None:
+                        if isinstance(result, str):
+                            return result
+                        return json.dumps(result)
+                    return json.dumps(data)
+                return str(data)
+        except URLError as e:
+            log.error("KV fetch failed for %s: %s", url, e)
+            return None
+        except Exception as e:
+            log.error("KV parse error for %s: %s", url, e)
+            return None
+
+    def resolve_escrow_result(self, escrow: dict, network: str = "testnet") -> Optional[str]:
+        """Resolve the actual work result from an escrow, handling KV references.
+
+        If the result is a KV reference (JSON with kv_account/kv_key), fetches from KV.
+        Otherwise returns the result directly.
+        """
+        result = escrow.get("result")
+        if not result:
+            return None
+
+        # Check if it's a KV reference
+        try:
+            ref = json.loads(result)
+            if isinstance(ref, dict) and "kv_account" in ref:
+                log.info("Fetching result from KV: %s/%s/%s", ref.get("kv_account"), ref.get("kv_predecessor"), ref.get("kv_key"))
+                return self.fetch_kv_result(result, network)
+        except (json.JSONDecodeError, AttributeError):
+            pass
+
+        # Plain text result — return as-is
         return result
 
     # ------------------------------------------------------------------

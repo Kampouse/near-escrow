@@ -83,9 +83,11 @@ def parse_task_event(event: dict) -> dict | None:
 
     reward_parts = tags.get("reward", ["0", "near"])
 
-    # Extract signed action from tags
+    # Extract signed actions from tags
     action_json = tags.get("action", [None])[0]
     action_sig_hex = tags.get("action_sig", [None])[0]
+    fund_action_json = tags.get("fund_action", [None])[0]
+    fund_action_sig_hex = tags.get("fund_action_sig", [None])[0]
 
     return {
         "event_id": event.get("id"),
@@ -107,6 +109,8 @@ def parse_task_event(event: dict) -> dict | None:
         # Signed action fields
         "action_json": action_json,
         "action_sig_hex": action_sig_hex,
+        "fund_action_json": fund_action_json,
+        "fund_action_sig_hex": fund_action_sig_hex,
     }
 
 
@@ -457,7 +461,13 @@ class NostrRelayer:
             )
 
     async def _on_signed_action(self, task: dict):
-        """Submit signed CreateEscrow action to the agent's msig contract."""
+        """Submit signed CreateEscrow + FundEscrow actions to the agent's msig contract.
+
+        Flow for kind 41000:
+        1. Submit CreateEscrow action (action + action_sig tags)
+        2. Submit FundEscrow action (fund_action + fund_action_sig tags) if present
+        3. Publish kind 41004 (FUNDED) to Nostr on success
+        """
         log.info(
             "Signed action: job_id=%s msig=%s",
             task["job_id"], task["agent"],
@@ -472,11 +482,11 @@ class NostrRelayer:
             log.error("No msig address (agent tag) in event")
             return
 
+        # --- Step 1: Submit CreateEscrow ---
         if not task["action_sig_hex"]:
             log.error("No action signature in event for job %s", task["job_id"])
             return
 
-        # Decode signature from hex
         try:
             sig_bytes = bytes.fromhex(task["action_sig_hex"])
         except (ValueError, TypeError):
@@ -487,7 +497,7 @@ class NostrRelayer:
             log.error("Invalid signature length %d for job %s (expected 64)", len(sig_bytes), task["job_id"])
             return
 
-        # Rate limit check — enqueue instead of dropping to preserve nonce order
+        # Rate limit check
         if not self._check_rate_limit(msig_address):
             log.warning("Rate limited, enqueueing signed action for retry: job %s", task["job_id"])
             self._enqueue_retry(
@@ -501,30 +511,109 @@ class NostrRelayer:
             self._record_rate_limit(msig_address)
 
             if result["success"]:
-                log.info("Action confirmed on-chain: job_id=%s tx=%s", task["job_id"], result["tx_hash"][:16])
+                log.info("CreateEscrow confirmed: job_id=%s tx=%s", task["job_id"], result["tx_hash"][:16])
             elif result["nonce_consumed"]:
-                # Nonce was consumed even though execute failed — cross-contract
-                # call inside execute() failed. Action is dead, can't retry.
                 log.error(
-                    "Action failed but nonce consumed — dropping: job=%s tx=%s error=%s",
-                    task["job_id"], result["tx_hash"][:16], (result["error"] or "")[:80],
+                    "CreateEscrow failed (nonce consumed) — dropping: job=%s error=%s",
+                    task["job_id"], (result["error"] or "")[:80],
                 )
+                return  # Can't continue — nonce is ahead
             else:
-                # Nonce NOT consumed — tx reverted entirely (bad sig, bad nonce).
-                # Safe to retry later.
-                log.warning("Action reverted (nonce not consumed) — retrying: job=%s", task["job_id"])
+                log.warning("CreateEscrow reverted — retrying: job=%s", task["job_id"])
                 self._enqueue_retry(
                     msig_address, task["action_json"], sig_bytes,
                     "CreateEscrow", attempt=1,
                 )
+                return
 
         except Exception as e:
-            # Network/RPC error — tx may or may not have landed. Retry to be safe.
-            log.error("RPC error executing action for %s: %s", task["job_id"], e)
+            log.error("RPC error on CreateEscrow for %s: %s", task["job_id"], e)
             self._enqueue_retry(
                 msig_address, task["action_json"], sig_bytes,
                 "CreateEscrow", attempt=1,
             )
+            return
+
+        # --- Step 2: Submit FundEscrow (if present) ---
+        if task.get("fund_action_json") and task.get("fund_action_sig_hex"):
+            try:
+                fund_sig_bytes = bytes.fromhex(task["fund_action_sig_hex"])
+            except (ValueError, TypeError):
+                log.error("Invalid fund_action signature hex for job %s", task["job_id"])
+                return
+
+            if len(fund_sig_bytes) != 64:
+                log.error("Invalid fund_action signature length for job %s", task["job_id"])
+                return
+
+            # Rate limit check
+            if not self._check_rate_limit(msig_address):
+                log.warning("Rate limited, enqueueing FundEscrow for retry: job %s", task["job_id"])
+                self._enqueue_retry(
+                    msig_address, task["fund_action_json"], fund_sig_bytes,
+                    "FundEscrow", attempt=1,
+                )
+                return
+
+            try:
+                fund_result = self._submit_action(msig_address, task["fund_action_json"], fund_sig_bytes)
+                self._record_rate_limit(msig_address)
+
+                if fund_result["success"]:
+                    log.info("FundEscrow confirmed: job_id=%s tx=%s", task["job_id"], fund_result["tx_hash"][:16])
+
+                    # --- Step 3: Publish kind 41004 (FUNDED) ---
+                    await self._publish_funded_event(task)
+
+                elif fund_result["nonce_consumed"]:
+                    log.error(
+                        "FundEscrow failed (nonce consumed) — escrow created but unfunded: job=%s error=%s",
+                        task["job_id"], (fund_result["error"] or "")[:80],
+                    )
+                else:
+                    log.warning("FundEscrow reverted — retrying: job=%s", task["job_id"])
+                    self._enqueue_retry(
+                        msig_address, task["fund_action_json"], fund_sig_bytes,
+                        "FundEscrow", attempt=1,
+                    )
+
+            except Exception as e:
+                log.error("RPC error on FundEscrow for %s: %s", task["job_id"], e)
+                self._enqueue_retry(
+                    msig_address, task["fund_action_json"], fund_sig_bytes,
+                    "FundEscrow", attempt=1,
+                )
+        else:
+            # No fund_action in event — just log (may come via separate 41003)
+            log.info("No fund_action in event for job %s — awaiting separate funding", task["job_id"])
+
+    async def _publish_funded_event(self, task: dict):
+        """Publish a kind 41004 (FUNDED) event to Nostr relays."""
+        import hashlib
+        import time as _time
+
+        event = {
+            "kind": 41004,
+            "created_at": int(_time.time()),
+            "tags": [
+                ["job_id", task["job_id"]],
+                ["agent", task["agent"]],
+                ["escrow", task["escrow_contract"]],
+                ["reward", task["reward_amount"], task["reward_token"]],
+            ],
+            "content": json.dumps({"status": "funded"}),
+        }
+
+        # Post to all relays (best-effort, unsigned for now)
+        message = json.dumps(["EVENT", event])
+        for relay_url in self.relays:
+            try:
+                async with websockets.connect(relay_url) as ws:
+                    await ws.send(message)
+                    resp = await asyncio.wait_for(ws.recv(), timeout=5)
+                    log.info("Published 41004 FUNDED for %s to %s: %s", task["job_id"], relay_url, resp[:80])
+            except Exception as e:
+                log.warning("Failed to publish 41004 to %s: %s", relay_url, e)
 
     async def _on_generic_action(self, event: dict):
         """Handle kind 41003 generic signed action events (fund, cancel, withdraw, etc.)."""

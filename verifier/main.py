@@ -95,9 +95,11 @@ def process_verifying_escrow(
         log.warning("Escrow %s is %s, not Verifying — skipping", job_id, escrow.get("status"))
         return False
 
-    result = escrow.get("result")
+    # Resolve the actual result — fetch from KV if it's a reference
+    network = "testnet" if "testnet" in near.config.get("rpc_url", "") else "mainnet"
+    result = near.resolve_escrow_result(escrow, network)
     if not result:
-        log.error("Escrow %s has no result", job_id)
+        log.error("Escrow %s has no result (KV fetch may have failed)", job_id)
         return False
 
     task_description = escrow.get("task_description", "")
@@ -105,8 +107,8 @@ def process_verifying_escrow(
     threshold = escrow.get("score_threshold", 80)
 
     log.info(
-        "Scoring escrow %s (threshold=%d, criteria=%s...)",
-        job_id, threshold, criteria[:60],
+        "Scoring escrow %s (threshold=%d, result_len=%d, criteria=%s...)",
+        job_id, threshold, len(result), criteria[:60],
     )
 
     # Score the work

@@ -3459,7 +3459,7 @@ fn test_competitive_standard_mode_unchanged() -> Result<()> {
     })
 }
 
-/// Test: designate_winner happy path — competitive mode
+// Test: designate_winner happy path — competitive mode
 /// BLOCKER FIX: Adds test coverage for competitive mode designate_winner.
 /// Creates competitive escrow, two workers submit, agent designates winner,
 /// verifies escrow transitions to Verifying with correct worker set.
@@ -3587,4 +3587,266 @@ fn test_designate_winner_happy_path() -> Result<()> {
         println!("✓ test_designate_winner_happy_path: competitive designate_winner works correctly");
         Ok(())
     })
+}
+
+// ══════════════════════════════════════════════════════════════════
+// NEW INTEGRATION TESTS — previously untested methods
+// ══════════════════════════════════════════════════════════════════
+
+// Test: link_near_account — worker links their Nostr key to a NEAR account
+#[tokio::test]
+async fn test_link_near_account() -> Result<()> {
+    let env = setup_env().await?;
+    let worker_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+    let worker_pk_hex = hex::encode(worker_sk.verifying_key().as_bytes());
+
+    // Register worker
+    env.escrow.call("register_worker")
+        .args_json(json!({ "nostr_pubkey": worker_pk_hex }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    // Sign link message: "link:{near_account_id}:{nonce}"
+    let near_account = env.worker_account.id().to_string();
+    let link_message = format!("link:{}:{}", near_account, 0);
+    let sig = worker_sk.sign(link_message.as_bytes());
+    let sig_bytes = sig.to_bytes().to_vec();
+
+    // Link
+    env.escrow.call("link_near_account")
+        .args_json(json!({
+            "worker_pubkey": worker_pk_hex,
+            "near_account_id": near_account,
+            "signature": sig_bytes,
+        }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    // Verify linked
+    let info: serde_json::Value = env.escrow.view("get_worker_info")
+        .args_json(json!({ "worker_pubkey": worker_pk_hex }))
+        .await?.json()?;
+    assert_eq!(info["near_account_id"], near_account, "Should be linked");
+    assert_eq!(info["nonce"], 1, "Nonce should be incremented");
+
+    println!("✓ test_link_near_account passed");
+    Ok(())
+}
+
+// Test: link_near_account with wrong nonce rejected
+#[tokio::test]
+async fn test_link_near_account_wrong_nonce() -> Result<()> {
+    let env = setup_env().await?;
+    let worker_sk = ed25519_dalek::SigningKey::from_bytes(&[43u8; 32]);
+    let worker_pk_hex = hex::encode(worker_sk.verifying_key().as_bytes());
+
+    env.escrow.call("register_worker")
+        .args_json(json!({ "nostr_pubkey": worker_pk_hex }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    // Sign with nonce=5 (wrong, should be 0)
+    let link_message = format!("link:{}:{}", env.worker_account.id(), 5);
+    let sig = worker_sk.sign(link_message.as_bytes());
+
+    let result = env.escrow.call("link_near_account")
+        .args_json(json!({
+            "worker_pubkey": worker_pk_hex,
+            "near_account_id": env.worker_account.id().to_string(),
+            "signature": sig.to_bytes().to_vec(),
+        }))
+        .gas(GAS_STORAGE)
+        .transact().await?;
+
+    assert!(result.is_failure(), "Should fail with wrong nonce");
+    println!("✓ test_link_near_account_wrong_nonce passed");
+    Ok(())
+}
+
+// Test: set_worker_stake + get_worker_stake
+#[tokio::test]
+async fn test_set_worker_stake() -> Result<()> {
+    let env = setup_env().await?;
+
+    let stake: serde_json::Value = env.escrow.view("get_worker_stake").await?.json()?;
+    println!("Initial stake: {:?}", stake);
+
+    env.escrow.call("set_worker_stake")
+        .args_json(json!({ "amount": "200000000000000000000000" }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let new_stake: serde_json::Value = env.escrow.view("get_worker_stake").await?.json()?;
+    assert_ne!(new_stake, stake, "Stake should have changed");
+
+    // Non-owner should fail
+    let result = env.worker_account.call(env.escrow.id(), "set_worker_stake")
+        .args_json(json!({ "amount": "100" }))
+        .gas(GAS_STORAGE)
+        .transact().await?;
+    assert!(result.is_failure(), "Non-owner should be rejected");
+
+    println!("✓ test_set_worker_stake passed");
+    Ok(())
+}
+
+// Test: add_verifier / deactivate_verifier / get_verifier_set / is_multi_verifier#[tokio::test]
+async fn test_verifier_management() -> Result<()> {
+    let env = setup_env().await?;
+
+    let set: Vec<serde_json::Value> = env.escrow.view("get_verifier_set").await?.json()?;
+    let initial_count = set.len();
+
+    let new_pk = "ab".repeat(32);
+    env.escrow.call("add_verifier")
+        .args_json(json!({ "account_id": "verifier2.test.near", "public_key": new_pk }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let set_after: Vec<serde_json::Value> = env.escrow.view("get_verifier_set").await?.json()?;
+    assert_eq!(set_after.len(), initial_count + 1);
+
+    env.escrow.call("deactivate_verifier")
+        .args_json(json!({ "index": 1 }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let set_deact: Vec<serde_json::Value> = env.escrow.view("get_verifier_set").await?.json()?;
+    assert_eq!(set_deact[1]["active"], false);
+
+    println!("✓ test_verifier_management passed");
+    Ok(())
+}
+
+// Test: add_allowed_token / remove_allowed_token / get_allowed_tokens
+#[tokio::test]
+async fn test_token_allowlist_management() -> Result<()> {
+    let env = setup_env().await?;
+
+    let tokens: Vec<String> = env.escrow.view("get_allowed_tokens").await?.json()?;
+    assert!(tokens.is_empty());
+
+    env.escrow.call("add_allowed_token")
+        .args_json(json!({ "token": "usdt.tether-token.near" }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let tokens_after: Vec<String> = env.escrow.view("get_allowed_tokens").await?.json()?;
+    assert_eq!(tokens_after.len(), 1);
+
+    env.escrow.call("remove_allowed_token")
+        .args_json(json!({ "token": "usdt.tether-token.near" }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let tokens_final: Vec<String> = env.escrow.view("get_allowed_tokens").await?.json()?;
+    assert!(tokens_final.is_empty());
+
+    println!("✓ test_token_allowlist_management passed");
+    Ok(())
+}
+
+// Test: list_by_status
+#[tokio::test]
+async fn test_list_by_status() -> Result<()> {
+    let env = setup_env().await?;
+
+    for i in 0..3u8 {
+        let job_id = format!("list-test-{}", i);
+        create_escrow_via_msig(&env, &job_id, "1000000", 24, None, None).await?;
+        fund_escrow_via_msig(&env, &job_id, "1000000").await?;
+    }
+
+    let open: Vec<serde_json::Value> = env.escrow.view("list_by_status")
+        .args_json(json!({ "status": "Open", "from_index": 0, "limit": 10 }))
+        .await?.json()?;
+    assert!(open.len() >= 3);
+
+    let claimed: Vec<serde_json::Value> = env.escrow.view("list_by_status")
+        .args_json(json!({ "status": "Claimed", "from_index": 0, "limit": 10 }))
+        .await?.json()?;
+    assert!(claimed.is_empty());
+
+    println!("✓ test_list_by_status passed");
+    Ok(())
+}
+
+// Test: worker withdraws their internal NEAR balance
+#[tokio::test]
+async fn test_worker_withdraw() -> Result<()> {
+    let env = setup_env().await?;
+    let worker_sk = ed25519_dalek::SigningKey::from_bytes(&[55u8; 32]);
+    let worker_pk_hex = hex::encode(worker_sk.verifying_key().as_bytes());
+
+    env.escrow.call("register_worker")
+        .args_json(json!({ "nostr_pubkey": worker_pk_hex }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let deposit_amount = 500_000_000_000_000_000_000_000u128;
+    env.escrow.call("deposit_to_worker")
+        .args_json(json!({ "worker_pubkey": worker_pk_hex }))
+        .deposit(near_workspaces::types::NearToken::from_yoctonear(deposit_amount))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    // Sign: "{contract}:withdraw:{token}:{amount}:{to}:{nonce}"
+    let withdraw_amount = 100_000_000_000_000_000_000_000u128;
+    let to = env.worker_account.id().to_string();
+    let message = format!("{}:withdraw:near:{}:{}:{}", env.escrow.id(), withdraw_amount, to, 0);
+    let sig = worker_sk.sign(message.as_bytes());
+
+    env.escrow.call("withdraw")
+        .args_json(json!({
+            "worker_pubkey": worker_pk_hex,
+            "token": "near",
+            "amount": withdraw_amount.to_string(),
+            "to": to,
+            "signature": sig.to_bytes().to_vec(),
+        }))
+        .gas(GAS_RESUME)
+        .transact().await?.into_result()?;
+
+    let info: serde_json::Value = env.escrow.view("get_worker_info")
+        .args_json(json!({ "worker_pubkey": worker_pk_hex }))
+        .await?.json()?;
+    assert_eq!(info["nonce"], 1);
+
+    println!("✓ test_worker_withdraw passed");
+    Ok(())
+}
+
+// Test: owner transfer propose_owner + accept_owner
+#[tokio::test]
+async fn test_owner_transfer_flow() -> Result<()> {
+    let env = setup_env().await?;
+
+    let new_owner = env.worker_account.id().to_string();
+    env.escrow.call("propose_owner")
+        .args_json(json!({ "new_owner": new_owner }))
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let pending: serde_json::Value = env.escrow.view("get_pending_owner").await?.json()?;
+    assert_eq!(pending, new_owner);
+
+    // Accept from correct account
+    env.worker_account.call(env.escrow.id(), "accept_owner")
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    // Old owner can't pause
+    let result = env.escrow.call("pause").gas(GAS_STORAGE).transact().await?;
+    assert!(result.is_failure());
+
+    // New owner can
+    env.worker_account.call(env.escrow.id(), "pause")
+        .gas(GAS_STORAGE)
+        .transact().await?.into_result()?;
+
+    let paused: bool = env.escrow.view("is_paused").await?.json()?;
+    assert!(paused);
+
+    println!("✓ test_owner_transfer_flow passed");
+    Ok(())
 }

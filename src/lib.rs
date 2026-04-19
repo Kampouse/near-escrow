@@ -2469,6 +2469,44 @@ escrow.submissions.push(Submission {
         assert!(env::state_exists(), "No state to migrate — use new() for fresh deploy");
         log!("Migration complete — no state changes needed");
     }
+
+    // ── Debug methods for sandbox testing ──────────────────────────────
+
+    /// Get contract's own account ID. Debug/sandbox only.
+    pub fn debug_current_account_id(&self) -> String {
+        env::current_account_id().to_string()
+    }
+
+    /// Verify an ed25519 signature (bytes). Debug/sandbox only.
+    pub fn debug_ed25519_verify(
+        &self,
+        pubkey: Vec<u8>,
+        signature: Vec<u8>,
+        message: String,
+    ) -> bool {
+        if pubkey.len() != 32 || signature.len() != 64 {
+            return false;
+        }
+        near_sdk::env::ed25519_verify(
+            signature.as_slice().try_into().unwrap(),
+            message.as_bytes(),
+            pubkey.as_slice().try_into().unwrap(),
+        )
+    }
+
+    /// Verify an ed25519 signature (hex). Debug/sandbox only.
+    pub fn debug_ed25519_verify_hex(
+        &self,
+        pubkey_hex: String,
+        signature: Vec<u8>,
+        message: String,
+    ) -> bool {
+        let pk_bytes = match hex::decode(&pubkey_hex) {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        self.debug_ed25519_verify(pk_bytes, signature, message)
+    }
 }
 
 #[cfg(test)]

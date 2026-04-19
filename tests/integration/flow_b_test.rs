@@ -56,7 +56,7 @@ async fn setup_flow_b() -> Result<FlowBEnv> {
     let ft = worker.dev_deploy(&ft_wasm).await?;
 
     // Init escrow — owner = escrow contract itself (so escrow.call() acts as owner)
-    escrow.call("new").args_json(json!({ "verifier_account_id": null })).gas(GAS_INIT).transact().await?.into_result()?;
+    escrow.call("new").args_json(json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]})).gas(GAS_INIT).transact().await?.into_result()?;
 
     // Init FT mock
     ft.call("new").gas(GAS_INIT).transact().await?.into_result()?;
@@ -652,7 +652,7 @@ async fn test_ed25519_verify_works() -> Result<()> {
     let worker = near_workspaces::sandbox().await?;
     let wasm = std::fs::read(ESCROW_WASM)?;
     let contract = worker.dev_deploy(&wasm).await?;
-    contract.call("new").args_json(json!({ "verifier_account_id": null })).gas(GAS_INIT).transact().await?.into_result()?;
+    contract.call("new").args_json(json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]})).gas(GAS_INIT).transact().await?.into_result()?;
 
     let sk = gen_worker_key();
     let verifying_key = sk.verifying_key();
@@ -690,7 +690,7 @@ async fn test_ed25519_verify_hex_works() -> Result<()> {
     let worker = near_workspaces::sandbox().await?;
     let wasm = std::fs::read(ESCROW_WASM)?;
     let contract = worker.dev_deploy(&wasm).await?;
-    contract.call("new").args_json(json!({ "verifier_account_id": null })).gas(GAS_INIT).transact().await?.into_result()?;
+    contract.call("new").args_json(json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]})).gas(GAS_INIT).transact().await?.into_result()?;
 
     let sk = gen_worker_key();
     let verifying_key = sk.verifying_key();
@@ -730,7 +730,7 @@ async fn test_claim_for_message_debug() -> Result<()> {
     let worker = near_workspaces::sandbox().await?;
     let wasm = std::fs::read(ESCROW_WASM)?;
     let contract = worker.dev_deploy(&wasm).await?;
-    contract.call("new").args_json(json!({ "verifier_account_id": null })).gas(GAS_INIT).transact().await?.into_result()?;
+    contract.call("new").args_json(json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]})).gas(GAS_INIT).transact().await?.into_result()?;
 
     let sk = gen_worker_key();
     let wpk = worker_pubkey_hex(&sk);

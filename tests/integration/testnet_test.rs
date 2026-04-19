@@ -13,7 +13,7 @@ async fn test_deploy_on_testnet() -> anyhow::Result<()> {
     
     // Initialize (new takes Option<AccountId>, pass null for None)
     contract.call("new")
-        .args_json(serde_json::json!({ "verifier_account_id": null }))
+        .args_json(serde_json::json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]}))
         .max_gas()
         .transact().await?.into_result()?;
     println!("escrow initialized OK");

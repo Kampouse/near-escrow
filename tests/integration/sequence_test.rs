@@ -23,7 +23,7 @@ async fn test_deploy_all_in_sequence() -> anyhow::Result<()> {
     
     // 4. Initialize escrow
     escrow.call("new")
-        .args_json(serde_json::json!({"verifier_account_id": Option::<String>::None}))
+        .args_json(serde_json::json!({"verifier_set":[{"account_id":"verifier.test.near","public_key":"0000000000000000000000000000000000000000000000000000000000000000","active":true}],"consensus_threshold":1,"allowed_tokens":[]}))
         .max_gas()
         .transact()
         .await?

@@ -17,6 +17,8 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 k256 = { version = "0.13", features = ["schnorr"] }
 sha2 = "0.10"
+nostr = "0.37"
+nostr-sdk = "0.37"
 
 [[test]]
 name = "integration"

@@ -690,8 +690,12 @@ INLAYER_NETWORK = "sandbox"
         }
     }
     
-    // ── Step 4: Build and post a kind 41000 event ────────────────
-    // Create the action JSON that the msig would execute
+    // ── Step 4: Build and post a SIGNED kind 41000 event (NIP-01) ──
+    use nostr::prelude::*;
+    
+    let nostr_keys = Keys::generate();
+    let nostr_pk_hex = nostr_keys.public_key().to_hex();
+    
     let job_id = format!("e2e-local-{}", std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?.as_secs());
     
@@ -699,7 +703,7 @@ INLAYER_NETWORK = "sandbox"
         "nonce": 1,
         "action": {
             "type": "create_escrow",
-            "job_id": job_id,
+            "job_id": &job_id,
             "amount": "1000000",
             "token": ft.id().to_string(),
             "timeout_hours": 24,
@@ -716,7 +720,7 @@ INLAYER_NETWORK = "sandbox"
         "nonce": 2,
         "action": {
             "type": "fund_escrow",
-            "job_id": job_id,
+            "job_id": &job_id,
             "token": ft.id().to_string(),
             "amount": "1000000",
         }
@@ -724,35 +728,30 @@ INLAYER_NETWORK = "sandbox"
     let fund_action_json = fund_action.to_string();
     let fund_sig = agent_sk.sign(fund_action_json.as_bytes());
     
-    // Build Nostr event (unsigned — relay may reject, but we test the pipe)
-    let agent_pk_hex = hex::encode(agent_sk.verifying_key().as_bytes());
-    let created_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?.as_secs();
+    let created_at = Timestamp::now();
     
-    let event = json!({
-        "kind": 41000,
-        "created_at": created_at,
-        "tags": [
-            ["job_id", &job_id],
-            ["agent", msig.id().as_str()],
-            ["escrow", escrow.id().as_str()],
-            ["reward", "1000000", ft.id().as_str()],
-            ["npub", &agent_pk_hex],
-            ["action", &create_action_json],
-            ["action_sig", hex::encode(create_sig.to_bytes())],
-            ["fund_action", &fund_action_json],
-            ["fund_action_sig", hex::encode(fund_sig.to_bytes())],
-            ["timeout", "24"],
-            ["category", "test"],
-        ],
-        "content": json!({
-            "task_description": "Local E2E test task",
-            "criteria": "Must pass all tests",
-        }).to_string(),
-        "pubkey": agent_pk_hex,
-    });
+    // Build Nostr event using the SDK
+    let builder = EventBuilder::new(
+        Kind::Custom(41000),
+        json!({"task_description": "Local E2E test task", "criteria": "Must pass all tests"}).to_string(),
+    ).tags([
+        Tag::custom(TagKind::Custom("job_id".into()), [job_id.clone()]),
+        Tag::custom(TagKind::Custom("agent".into()), [msig.id().to_string()]),
+        Tag::custom(TagKind::Custom("escrow".into()), [escrow.id().to_string()]),
+        Tag::custom(TagKind::Custom("reward".into()), ["1000000".into(), ft.id().to_string()]),
+        Tag::custom(TagKind::Custom("npub".into()), [nostr_pk_hex.clone()]),
+        Tag::custom(TagKind::Custom("action".into()), [create_action_json]),
+        Tag::custom(TagKind::Custom("action_sig".into()), [hex::encode(create_sig.to_bytes())]),
+        Tag::custom(TagKind::Custom("fund_action".into()), [fund_action_json]),
+        Tag::custom(TagKind::Custom("fund_action_sig".into()), [hex::encode(fund_sig.to_bytes())]),
+        Tag::custom(TagKind::Custom("timeout".into()), ["24".into()]),
+        Tag::custom(TagKind::Custom("category".into()), ["test".into()]),
+    ]);
     
-    println!("📡 Posting kind 41000 event (job_id={})", job_id);
+    let event = builder.sign_with_keys(&nostr_keys)?;
+    
+    println!("📡 Posting SIGNED kind 41000 event (job_id={})", job_id);
+    println!("   event_id: {}", event.id.to_hex());
     
     // Post to Nostr via websocket
     use futures_util::{SinkExt, StreamExt};
@@ -760,11 +759,11 @@ INLAYER_NETWORK = "sandbox"
         "wss://nostr-relay-production.up.railway.app"
     ).await.map_err(|e| anyhow::anyhow!("Nostr connect failed: {}", e))?;
     
-    ws.send(tokio_tungstenite::tungstenite::Message::Text(
-        json!(["EVENT", event]).to_string()
-    )).await.map_err(|e| anyhow::anyhow!("Nostr send failed: {}", e))?;
+    let event_json = serde_json::to_string(&json!(["EVENT", event.as_json()]))?;
+    println!("   Sending {} bytes", event_json.len());
+    let msg = format!( "[\"EVENT\",{}", event_json); ws.send(tokio_tungstenite::tungstenite::Message::Text(msg))
+        .await.map_err(|e| anyhow::anyhow!("Nostr send failed: {}", e))?;
     
-    // Read response
     let resp = tokio::time::timeout(Duration::from_secs(5), ws.next()).await;
     match resp {
         Ok(Some(Ok(msg))) => {
@@ -773,8 +772,6 @@ INLAYER_NETWORK = "sandbox"
         }
         _ => println!("📡 Nostr: no response (timeout)"),
     }
-    
-    // ── Step 5: Check if relayer processed the event ─────────────
     // The relayer needs the msig's signing key to submit on sandbox.
     // Since sandbox doesn't have real keys, the relayer will likely
     // fail to submit. But we can verify it RECEIVED and PARSED the event.

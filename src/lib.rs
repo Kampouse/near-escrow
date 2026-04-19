@@ -311,7 +311,10 @@ fn verify_worker_signature(pubkey_hex: &str, message: &str, signature: &[u8]) {
     let sig: [u8; 64] = signature.try_into().expect("sig len checked");
     assert!(
         env::ed25519_verify(&sig, message.as_bytes(), &pk),
-        "Invalid worker signature"
+        "Invalid worker signature: msg={} pk_len={} sig_len={}",
+        message,
+        pk.len(),
+        sig.len(),
     );
 }
 

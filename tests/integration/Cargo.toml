@@ -15,6 +15,8 @@ hex = "0.4"
 reqwest = { version = "0.12", features = ["json"] }
 tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
+k256 = { version = "0.13", features = ["schnorr"] }
+sha2 = "0.10"
 
 [[test]]
 name = "integration"

@@ -1860,7 +1860,8 @@ escrow.submissions.push(Submission {
     pub fn retry_settlement(&mut self, job_id: String) {
         let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
         let valid = escrow.status == EscrowStatus::SettlementFailed
-            || (escrow.status == EscrowStatus::Verifying && escrow.settlement_target.is_some());
+            || (escrow.status == EscrowStatus::Verifying && escrow.settlement_target.is_some())
+            || (escrow.status == EscrowStatus::Cancelled && escrow.settlement_target.is_some());
         assert!(
             valid,
             "Not retryable — must be SettlementFailed or Verifying with target"
@@ -1870,10 +1871,13 @@ escrow.submissions.push(Submission {
         // Max retries — auto-cancel after threshold
         escrow.retry_count += 1;
         if escrow.retry_count > MAX_SETTLEMENT_RETRIES {
-            // Force cancel — FT contract may be permanently broken
+            // Force cancel — FT contract may be permanently broken.
+            // Keep settlement_target so agent can still call retry_settlement manually
+            // or an admin can extract funds. Don't burn the FT balance.
             transition_stats(&mut self.stats, &EscrowStatus::SettlementFailed, &EscrowStatus::Cancelled);
             escrow.status = EscrowStatus::Cancelled;
-            escrow.settlement_target = None;
+            // NOTE: settlement_target is KEPT — agent can retry or admin can recover
+            // Clearing it would permanently lock FT tokens in the contract.
             self.escrows.insert(&job_id, &escrow);
             // Refund storage deposit
             Promise::new(escrow.agent.clone())

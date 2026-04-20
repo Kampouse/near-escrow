@@ -189,6 +189,8 @@ pub struct Escrow {
     // Prevents double-payment on settlement retry.
     pub pending_payout: Option<U128>,        // Worker payout (FT amount) to credit to internal balance
     pub pending_stake_refund: Option<U128>,  // Worker stake (NEAR) to credit to internal balance
+    // Timestamp when escrow entered Verifying state — used for safety timeout calculation
+    pub verifying_since_ms: Option<u64>,
 }
 
 // --- Escrow view (public, no internal fields) ---
@@ -950,6 +952,7 @@ impl EscrowContract {
 
         escrow.data_id = Some(data_id);
         escrow.status = EscrowStatus::Verifying;
+        escrow.verifying_since_ms = Some(env::block_timestamp_ms());
         transition_stats(
             &mut self.stats,
             &EscrowStatus::InProgress,
@@ -1066,6 +1069,7 @@ impl EscrowContract {
             retry_count: 0,
             pending_payout: None,
             pending_stake_refund: None,
+            verifying_since_ms: None,
         };
 
         self.escrows.insert(&job_id, &escrow);
@@ -1299,6 +1303,7 @@ escrow.submissions.push(Submission {
 
         escrow.data_id = Some(data_id);
         escrow.status = EscrowStatus::Verifying;
+        escrow.verifying_since_ms = Some(env::block_timestamp_ms());
         self.escrows.insert(&job_id, &escrow);
         self.data_id_index.insert(&hex_encode(data_id.as_ref()), &job_id);
 
@@ -1961,6 +1966,7 @@ escrow.submissions.push(Submission {
         escrow.winner_idx = Some(winner_idx);
         transition_stats(&mut self.stats, &EscrowStatus::Open, &EscrowStatus::Verifying);
         escrow.status = EscrowStatus::Verifying;
+        escrow.verifying_since_ms = Some(env::block_timestamp_ms());
 
         // Winner's stake goes into worker_stake for normal settlement flow
         escrow.worker_stake = Some(winner.stake.clone());
@@ -2104,9 +2110,11 @@ escrow.submissions.push(Submission {
             "Escrow is not in Verifying state"
         );
 
-        // Safety timeout: must be at least VERIFICATION_SAFETY_TIMEOUT_MS since creation
+        // Safety timeout: 24h since the escrow ENTERED Verifying (not since creation).
+        // Uses verifying_since_ms which is set when the yield is created.
         let now = env::block_timestamp_ms();
-        let safety_deadline = escrow.created_at + escrow.timeout_ms + VERIFICATION_SAFETY_TIMEOUT_MS;
+        let verifying_start = escrow.verifying_since_ms.unwrap_or(escrow.created_at);
+        let safety_deadline = verifying_start + VERIFICATION_SAFETY_TIMEOUT_MS;
         assert!(
             now >= safety_deadline,
             "Too early to force cancel — safety timeout not met ({}ms remaining)",
@@ -2164,6 +2172,7 @@ escrow.submissions.push(Submission {
     /// Open / InProgress → FullRefund via settlement.
     /// Verifying → REJECTED — yield timeout handles this.
     pub fn refund_expired(&mut self, job_id: String) {
+        assert!(!self.paused, "Contract is paused");
         let mut escrow = self.escrows.get(&job_id).expect("Escrow not found");
         let now = env::block_timestamp_ms();
         assert!(now > escrow.created_at + escrow.timeout_ms, "Not expired");
@@ -2211,7 +2220,8 @@ escrow.submissions.push(Submission {
                 // verification safety timeout has elapsed. This prevents escrows from
                 // being permanently stuck if the verifier service goes down AND the
                 // yield timeout callback never fires.
-                let safety_deadline = escrow.created_at + escrow.timeout_ms + VERIFICATION_SAFETY_TIMEOUT_MS;
+                let verifying_start = escrow.verifying_since_ms.unwrap_or(escrow.created_at);
+                let safety_deadline = verifying_start + VERIFICATION_SAFETY_TIMEOUT_MS;
                 assert!(
                     now >= safety_deadline,
                     "Cannot refund while verifying — safety timeout not met ({}ms remaining). Use force_cancel_verifying after timeout.",

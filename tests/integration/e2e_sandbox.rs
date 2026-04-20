@@ -735,17 +735,17 @@ INLAYER_NETWORK = "sandbox"
         Kind::Custom(41000),
         json!({"task_description": "Local E2E test task", "criteria": "Must pass all tests"}).to_string(),
     ).tags([
-        Tag::custom(TagKind::Custom("job_id".into()), [job_id.clone()]),
-        Tag::custom(TagKind::Custom("agent".into()), [msig.id().to_string()]),
-        Tag::custom(TagKind::Custom("escrow".into()), [escrow.id().to_string()]),
-        Tag::custom(TagKind::Custom("reward".into()), ["1000000".into(), ft.id().to_string()]),
-        Tag::custom(TagKind::Custom("npub".into()), [nostr_pk_hex.clone()]),
-        Tag::custom(TagKind::Custom("action".into()), [create_action_json]),
-        Tag::custom(TagKind::Custom("action_sig".into()), [hex::encode(create_sig.to_bytes())]),
-        Tag::custom(TagKind::Custom("fund_action".into()), [fund_action_json]),
-        Tag::custom(TagKind::Custom("fund_action_sig".into()), [hex::encode(fund_sig.to_bytes())]),
-        Tag::custom(TagKind::Custom("timeout".into()), ["24".into()]),
-        Tag::custom(TagKind::Custom("category".into()), ["test".into()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("job_id".into()), vec![job_id.clone()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("agent".into()), vec![msig.id().to_string()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("escrow".into()), vec![escrow.id().to_string()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("reward".into()), vec!["1000000".into(), ft.id().to_string()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("npub".into()), vec![nostr_pk_hex.clone()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("action".into()), vec![create_action_json]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("action_sig".into()), vec![hex::encode(create_sig.to_bytes())]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("fund_action".into()), vec![fund_action_json]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("fund_action_sig".into()), vec![hex::encode(fund_sig.to_bytes())]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("timeout".into()), vec!["24".into()]),
+        Tag::custom::<Vec<String>, String>(TagKind::Custom("category".into()), vec!["test".into()]),
     ]);
     
     let event = builder.sign_with_keys(&nostr_keys)?;

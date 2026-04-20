@@ -185,6 +185,10 @@ pub struct Escrow {
     pub winner_idx: Option<u32>,       // Competitive: index of winning submission
     pub deadline_block: Option<u64>,   // Competitive: optional submission deadline
     pub retry_count: u8,               // Settlement retry counter (auto-cancel after MAX_SETTLEMENT_RETRIES)
+    // Deferred credits — only applied in settle_callback on FT transfer success.
+    // Prevents double-payment on settlement retry.
+    pub pending_payout: Option<U128>,        // Worker payout (FT amount) to credit to internal balance
+    pub pending_stake_refund: Option<U128>,  // Worker stake (NEAR) to credit to internal balance
 }
 
 // --- Escrow view (public, no internal fields) ---
@@ -760,14 +764,12 @@ impl EscrowContract {
     /// Daemon relays the signed message on behalf of the worker.
     pub fn claim_for(&mut self, job_id: String, worker_pubkey: String, worker_signature: Vec<u8>) {
         assert!(!self.paused, "Contract is paused");
-        // Auto-register if needed
-        if self.workers.get(&worker_pubkey).is_none() {
-            self.workers.insert(&worker_pubkey, &WorkerAccount {
-                nostr_pubkey: worker_pubkey.clone(),
-                near_account_id: None,
-                nonce: 0,
-            });
-        }
+        // Workers must be pre-registered via register_worker before claiming.
+        // This prevents spam/bloat from arbitrary pubkeys claiming escrows.
+        assert!(
+            self.workers.get(&worker_pubkey).is_some(),
+            "Worker not registered — call register_worker first"
+        );
 
         // Pause check
         assert!(
@@ -1062,6 +1064,8 @@ impl EscrowContract {
             winner_idx: None,
             deadline_block,
             retry_count: 0,
+            pending_payout: None,
+            pending_stake_refund: None,
         };
 
         self.escrows.insert(&job_id, &escrow);
@@ -1349,7 +1353,7 @@ escrow.submissions.push(Submission {
 
         // Double-resume guard
         let matching_job = self.data_id_index.get(&data_id_hex);
-        let job_id_for_guard = matching_job.clone();
+        let _job_id_for_guard = matching_job.clone();
         if let Some(ref jid) = matching_job {
             let escrow = self.escrows.get(jid).expect("escrow vanished during index lookup");
             assert!(!escrow.yield_consumed, "Yield already consumed");
@@ -1371,12 +1375,9 @@ escrow.submissions.push(Submission {
         let payload = signed_verdict.verdict_json.as_bytes();
         env::promise_yield_resume(&data_id, payload);
 
-        // Mark consumed
-        if let Some(jid) = job_id_for_guard {
-            let mut escrow = self.escrows.get(&jid).expect("escrow vanished");
-            escrow.yield_consumed = true;
-            self.escrows.insert(&jid, &escrow);
-        }
+        // NOTE: yield_consumed is NOT set here. It is set in verification_callback
+        // after the yield actually resumes. If promise_yield_resume fails, the
+        // escrow stays retryable instead of permanently stuck.
 
         true
     }
@@ -1464,6 +1465,11 @@ escrow.submissions.push(Submission {
             return;
         }
 
+        // Mark yield consumed — this is the definitive point where the yield
+        // actually resumed. Setting it here (not in resume_verification_multi)
+        // ensures the escrow stays retryable if promise_yield_resume fails.
+        escrow.yield_consumed = true;
+
         let (settlement_target, verdict) = match result {
             Ok(data) => {
                 let parsed: Result<serde_json::Value, _> = serde_json::from_slice(&data);
@@ -1505,10 +1511,10 @@ escrow.submissions.push(Submission {
                         // Full refund to agent + worker stake refunded. Verifier failed, not the worker.
                         log!("Verifier sent malformed payload: {}", e);
                         if let Some(stake) = escrow.worker_stake {
-                            if let Some(ref wpk) = escrow.worker_pubkey {
-                                // Internal wallet: credit worker's NEAR balance
-                                credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                                log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (malformed verdict)", stake.0, wpk);
+                            if let Some(ref _wpk) = escrow.worker_pubkey {
+                                // Defer to settlement callback — prevents double-payment on retry
+                                escrow.pending_stake_refund = Some(stake);
+                                log!("Deferring worker stake credit to callback (malformed verdict)");
                             } else if let Some(ref worker) = escrow.worker {
                                 // Legacy: direct NEAR transfer
                                 Promise::new(worker.clone())
@@ -1534,10 +1540,10 @@ escrow.submissions.push(Submission {
                 // Worker stake REFUNDED to worker — timeout is verifier's fault, not worker's.
                 // Worker already did the work and submitted the result.
                 if let Some(stake) = escrow.worker_stake {
-                    if let Some(ref wpk) = escrow.worker_pubkey {
-                        // Internal wallet: credit worker's NEAR balance
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                        log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (verification timeout)", stake.0, wpk);
+                    if let Some(ref _wpk) = escrow.worker_pubkey {
+                        // Defer to settlement callback — prevents double-payment on retry
+                        escrow.pending_stake_refund = Some(stake);
+                        log!("Deferring worker stake credit to callback (verification timeout)");
                     } else if let Some(ref worker) = escrow.worker {
                         // Legacy: direct NEAR transfer
                         Promise::new(worker.clone())
@@ -1580,7 +1586,7 @@ escrow.submissions.push(Submission {
     /// If any transfer fails → SettlementFailed (admin can retry).
     fn _settle_escrow(&mut self, job_id: &str) {
         let job_id_string = job_id.to_string();
-        let escrow = self.escrows.get(&job_id_string).expect("Escrow not found for settlement");
+        let mut escrow = self.escrows.get(&job_id_string).expect("Escrow not found for settlement");
         let target = escrow
             .settlement_target
             .clone()
@@ -1589,32 +1595,31 @@ escrow.submissions.push(Submission {
         let total = escrow.amount.0;
         let vfee = escrow.verifier_fee.0;
 
-        // For worker_pubkey escrows: credit internal balance instead of FT-transfer to daemon.
-        // The daemon (relayer) is escrow.worker but shouldn't receive the payout — the worker owns it.
-        // Worker withdraws on their own schedule via withdraw().
-        if let Some(ref wpk) = escrow.worker_pubkey {
+        // Clear any stale pending credits from a previous failed settlement attempt.
+        // Credits are only applied in settle_callback on success.
+        escrow.pending_payout = None;
+        escrow.pending_stake_refund = None;
+
+        // For worker_pubkey escrows: defer internal balance credits to callback.
+        // This prevents double-payment if settlement fails and is retried.
+        if let Some(ref _wpk) = escrow.worker_pubkey {
             match target {
                 SettlementTarget::Claim => {
                     let payout = total.saturating_sub(vfee);
                     assert!(payout > 0, "Worker payout is zero");
-                    credit_balance(&mut self.balances, wpk, &token.to_string(), payout);
-                    if vfee > 0 {
-                        // Verifier fee goes to owner via FT transfer (not internal)
-                    }
+                    // Store pending credit — applied in settle_callback on success
+                    escrow.pending_payout = Some(U128(payout));
+                    escrow.pending_stake_refund = escrow.worker_stake;
+
                     let mut transfers = vec![];
                     if vfee > 0 {
                         transfers.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
                     }
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
                     self.escrows.insert(&job_id_string, &escrow);
                     if transfers.is_empty() {
-                        // No external transfers needed — settle immediately
+                        // No external transfers needed — settle immediately (apply credits)
                         return self._settle_callback_internal(&job_id_string);
                     }
-                    // Still need to FT-transfer verifier fee
                     let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args");
                     let settle_cb = Promise::new(env::current_account_id()).function_call(
                         "settle_callback".to_string(),
@@ -1629,12 +1634,10 @@ escrow.submissions.push(Submission {
                 SettlementTarget::Refund => {
                     let refund = total.saturating_sub(vfee);
                     assert!(refund > 0, "Agent refund is zero");
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
+                    // Worker stake refunded on refund (worker submitted but didn't win)
+                    escrow.pending_stake_refund = escrow.worker_stake;
+
                     self.escrows.insert(&job_id_string, &escrow);
-                    // FT-transfer refund to agent + verifier fee to owner
                     let mut transfers = vec![ft_transfer_promise(&token, escrow.agent.clone(), refund)];
                     if vfee > 0 {
                         transfers.push(ft_transfer_promise(&token, self.owner.clone(), vfee));
@@ -1652,10 +1655,8 @@ escrow.submissions.push(Submission {
                 }
                 SettlementTarget::FullRefund => {
                     assert!(total > 0, "Nothing to refund");
-                    // Refund worker stake to internal NEAR balance
-                    if let Some(stake) = escrow.worker_stake {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                    }
+                    escrow.pending_stake_refund = escrow.worker_stake;
+
                     self.escrows.insert(&job_id_string, &escrow);
                     let transfers = vec![ft_transfer_promise(&token, escrow.agent.clone(), total)];
                     let settle_args = serde_json::to_vec(&serde_json::json!({"job_id": job_id})).expect("settle args");
@@ -1717,13 +1718,20 @@ escrow.submissions.push(Submission {
     }
 
     /// Internal helper: directly settle escrow when all payouts are internal (no FT transfers).
+    /// Applies pending credits immediately since there are no FT transfers to fail.
     fn _settle_callback_internal(&mut self, job_id: &String) {
         let mut escrow = self.escrows.get(job_id).expect("Escrow not found");
         let target = escrow.settlement_target.clone().expect("No settlement target");
+        let old_status = escrow.status.clone();
+
+        // Apply pending credits (safe — no FT transfers to fail)
+        self._apply_pending_credits(&mut escrow);
+
         escrow.status = match target {
             SettlementTarget::Claim => EscrowStatus::Claimed,
             SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
         };
+        transition_stats(&mut self.stats, &old_status, &escrow.status);
         escrow.settlement_target = None;
 
         // Refund storage deposit to agent
@@ -1740,6 +1748,21 @@ escrow.submissions.push(Submission {
             }),
         );
         self.escrows.insert(job_id, &escrow);
+    }
+
+    /// Apply deferred credits from escrow to worker's internal balance.
+    /// Only called after FT transfers succeed (or when no FT transfers needed).
+    fn _apply_pending_credits(&mut self, escrow: &mut Escrow) {
+        if let Some(ref wpk) = escrow.worker_pubkey.clone() {
+            // Apply pending worker payout (FT token)
+            if let Some(payout) = escrow.pending_payout.take() {
+                credit_balance(&mut self.balances, &wpk, &escrow.token.to_string(), payout.0);
+            }
+            // Apply pending worker stake refund (NEAR)
+            if let Some(stake) = escrow.pending_stake_refund.take() {
+                credit_balance(&mut self.balances, &wpk, NEAR_TOKEN_ID, stake.0);
+            }
+        }
     }
 
     /// Callback after FT transfer batch completes.
@@ -1774,10 +1797,16 @@ escrow.submissions.push(Submission {
         }
 
         if all_ok {
+            let old_status = escrow.status.clone();
+
+            // Apply deferred credits ONLY on success — prevents double-payment on retry
+            self._apply_pending_credits(&mut escrow);
+
             escrow.status = match target {
                 SettlementTarget::Claim => EscrowStatus::Claimed,
                 SettlementTarget::Refund | SettlementTarget::FullRefund => EscrowStatus::Refunded,
             };
+            transition_stats(&mut self.stats, &old_status, &escrow.status);
             escrow.settlement_target = None;
 
             // Refund storage deposit to agent
@@ -1785,14 +1814,13 @@ escrow.submissions.push(Submission {
                 .transfer(NearToken::from_yoctonear(self.storage_deposit_yocto));
             log!("Refunding storage deposit: {} yoctoNEAR to agent {}", self.storage_deposit_yocto, escrow.agent);
 
-            // Refund worker stake on successful settlement (worker did their job)
-            if let Some(stake) = escrow.worker_stake {
-                if let Some(ref wpk) = escrow.worker_pubkey {
-                    // Internal wallet: already credited in _settle_escrow, just clear
-                    log!("Worker stake already credited to internal wallet {} (settlement)", wpk);
-                } else if let Some(ref worker) = escrow.worker {
-                    Promise::new(worker.clone()).transfer(NearToken::from_yoctonear(stake.0));
-                    log!("Refunding worker stake: {} yoctoNEAR to {} (settlement)", stake.0, worker);
+            // For legacy (no worker_pubkey): refund worker stake via NEAR transfer
+            if escrow.worker_pubkey.is_none() {
+                if let Some(stake) = escrow.worker_stake {
+                    if let Some(ref worker) = escrow.worker {
+                        Promise::new(worker.clone()).transfer(NearToken::from_yoctonear(stake.0));
+                        log!("Refunding worker stake: {} yoctoNEAR to {} (settlement)", stake.0, worker);
+                    }
                 }
             }
             escrow.worker_stake = None;
@@ -1805,7 +1833,10 @@ escrow.submissions.push(Submission {
                 }),
             );
         } else {
+            let old_status = escrow.status.clone();
             escrow.status = EscrowStatus::SettlementFailed;
+            transition_stats(&mut self.stats, &old_status, &EscrowStatus::SettlementFailed);
+            // Pending credits are NOT applied — they stay in escrow for retry
             emit_event("settlement_failed", &serde_json::json!({"job_id": job_id}));
         }
 
@@ -1835,6 +1866,7 @@ escrow.submissions.push(Submission {
         escrow.retry_count += 1;
         if escrow.retry_count > MAX_SETTLEMENT_RETRIES {
             // Force cancel — FT contract may be permanently broken
+            transition_stats(&mut self.stats, &EscrowStatus::SettlementFailed, &EscrowStatus::Cancelled);
             escrow.status = EscrowStatus::Cancelled;
             escrow.settlement_target = None;
             self.escrows.insert(&job_id, &escrow);
@@ -1927,6 +1959,7 @@ escrow.submissions.push(Submission {
         escrow.worker = Some(winner.worker.clone());
         escrow.result = Some(winner.result);
         escrow.winner_idx = Some(winner_idx);
+        transition_stats(&mut self.stats, &EscrowStatus::Open, &EscrowStatus::Verifying);
         escrow.status = EscrowStatus::Verifying;
 
         // Winner's stake goes into worker_stake for normal settlement flow
@@ -2026,6 +2059,7 @@ escrow.submissions.push(Submission {
 
         match escrow.status {
             EscrowStatus::PendingFunding => {
+                transition_stats(&mut self.stats, &EscrowStatus::PendingFunding, &EscrowStatus::Cancelled);
                 escrow.status = EscrowStatus::Cancelled;
                 self.escrows.insert(&job_id, &escrow);
                 // Refund storage deposit
@@ -2100,6 +2134,7 @@ escrow.submissions.push(Submission {
         escrow.yield_consumed = false;
 
         // Transition to Cancelled and refund escrow amount to agent via FT
+        transition_stats(&mut self.stats, &EscrowStatus::Verifying, &EscrowStatus::Cancelled);
         escrow.settlement_target = Some(SettlementTarget::FullRefund);
         escrow.status = EscrowStatus::Cancelled;
         self.escrows.insert(&job_id, &escrow);
@@ -2135,6 +2170,7 @@ escrow.submissions.push(Submission {
 
         match escrow.status {
             EscrowStatus::PendingFunding => {
+                transition_stats(&mut self.stats, &EscrowStatus::PendingFunding, &EscrowStatus::Cancelled);
                 escrow.status = EscrowStatus::Cancelled;
                 self.escrows.insert(&job_id, &escrow);
                 Promise::new(escrow.agent.clone())
@@ -2183,11 +2219,13 @@ escrow.submissions.push(Submission {
                 );
 
                 // Refund worker stake — worker submitted in good faith, verification stalled
-                if let Some(stake) = escrow.worker_stake {
-                    if let Some(ref wpk) = escrow.worker_pubkey {
-                        credit_balance(&mut self.balances, wpk, NEAR_TOKEN_ID, stake.0);
-                        log!("Crediting worker stake: {} yoctoNEAR to internal wallet {} (expired Verifying recovery)", stake.0, wpk);
-                    } else if let Some(ref worker) = escrow.worker {
+                // Defer internal wallet credits to callback (prevents double-payment on retry)
+                if escrow.worker_pubkey.is_some() && escrow.worker_stake.is_some() {
+                    escrow.pending_stake_refund = escrow.worker_stake;
+                    log!("Deferring worker stake credit to callback (Verifying recovery)");
+                } else if let Some(stake) = escrow.worker_stake {
+                    if let Some(ref worker) = escrow.worker {
+                        // Legacy: direct NEAR transfer (safe — not internal balance)
                         Promise::new(worker.clone())
                             .transfer(NearToken::from_yoctonear(stake.0));
                         log!("Refunding worker stake: {} yoctoNEAR to {} (expired Verifying recovery)", stake.0, worker);

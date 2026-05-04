@@ -282,11 +282,62 @@ impl Verifier {
                         }
                         info!("✓ verify_hash matches: {}", actual_hash);
                     } else {
-                        warn!("No verify_hash for job {} — skipping integrity check (worker trusted)", job_id);
+                        // FAIL CLOSED: no verify_hash means agent didn't specify
+                        // integrity requirements — reject the submission.
+                        error!(
+                            "🔒 No verify_hash for job {} — REJECTING (agent must provide verify_hash in task)",
+                            job_id
+                        );
+                        let original_event_id = {
+                            let event_ids = self.task_event_ids.lock().await;
+                            event_ids.get(&job_id).copied()
+                        };
+                        if let Some(event_id) = original_event_id {
+                            if let Err(e) = self.nostr.post_verified(
+                                &event_id,
+                                &job_id,
+                                &self.config.verifier_account_id,
+                                &self.config.verifier_did,
+                                &patch_id,
+                                false,
+                                0,
+                                "hash_check",
+                                0,
+                                "missing verify_hash — agent must provide integrity hash",
+                            ).await {
+                                error!("Failed to post no-hash VERIFIED: {:?}", e);
+                            }
+                        }
+                        return Ok(());
                     }
                 }
                 Err(e) => {
-                    warn!("Failed to hash verify/ directory: {:?}. Continuing without check.", e);
+                    // FAIL CLOSED: can't hash verify/ directory — reject
+                    error!(
+                        "🔒 Failed to hash verify/ directory for job {}: {:?} — REJECTING",
+                        job_id, e
+                    );
+                    let original_event_id = {
+                        let event_ids = self.task_event_ids.lock().await;
+                        event_ids.get(&job_id).copied()
+                    };
+                    if let Some(event_id) = original_event_id {
+                        if let Err(e2) = self.nostr.post_verified(
+                            &event_id,
+                            &job_id,
+                            &self.config.verifier_account_id,
+                            &self.config.verifier_did,
+                            &patch_id,
+                            false,
+                            0,
+                            "hash_check",
+                            0,
+                            &format!("verify/ hash computation failed: {:?}", e),
+                        ).await {
+                            error!("Failed to post hash-error VERIFIED: {:?}", e2);
+                        }
+                    }
+                    return Ok(());
                 }
             }
         } else {

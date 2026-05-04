@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "EscrowEventSchema",
-  "description": "Nostr event schema for NEAR escrow marketplace (NIP-01 compatible)",
+  "description": "Nostr event schema for NEAR escrow marketplace (NIP-01 compatible). Radicle repos replace inline task data — the Nostr layer handles coordination and signed action relay only.",
 
   "kinds": {
     "41000": {
       "name": "TASK",
-      "description": "Agent posts a new task. Contains signed CreateEscrow + FundEscrow actions.",
+      "description": "Agent posts a new task. Contains signed CreateEscrow + FundEscrow actions. Task data lives in a Radicle repo referenced by repo_rid tag.",
       "direction": "agent → relayer → chain",
       "required_tags": [
         ["job_id",     "<unique-id> — must match escrow contract job_id"],
@@ -14,23 +14,24 @@
         ["timeout",    "<hours>"],
         ["agent",      "<msig-contract-address>"],
         ["escrow",     "<escrow-contract-account-id>"],
+        ["repo_rid",   "<radicle-repository-id> — e.g. rad:z4Ybyw4fybeProB6iQx6AVbESsdYn"],
         ["action",     "<json-string — signed Action object (CreateEscrow) at nonce N>"],
         ["action_sig", "<hex-encoded-64-byte-ed25519-signature>"],
         ["fund_action",     "<json-string — signed Action object (FundEscrow) at nonce N+1>"],
         ["fund_action_sig", "<hex-encoded-64-byte-ed25519-signature>"]
       ],
       "optional_tags": [
-        ["npub",           "<nostr-pubkey-hex>"],
-        ["verifier_fee",   "<amount>"],
-        ["score_threshold","<0-100>"],
-        ["category",       "<coding|writing|research|analysis|...>"],
-        ["skills",         "<skill1>", "<skill2>", "..."]
+        ["npub",            "<nostr-pubkey-hex>"],
+        ["verifier_did",    "<radicle-DID> — verifier's did:key, added to repo allow-list"],
+        ["verifier_fee",    "<amount>"],
+        ["score_threshold", "<0-100>"],
+        ["category",        "<coding|writing|research|analysis|ml|data|...>"],
+        ["skills",          "<skill1>", "<skill2>", "..."],
+        ["task_type",       "<code|document|data|prompt|mixed>"]
       ],
-      "content": "JSON with task_description and criteria",
-      "content_example": {
-        "task_description": "Build a REST API for user authentication with JWT tokens",
-        "criteria": "Must include: signup, login, logout endpoints. Password hashing with bcrypt. JWT token management. Unit tests with >90% coverage."
-      }
+      "content": "Brief human-readable task description (for discovery). Full spec is in the Radicle repo.",
+      "content_example": "Train a sentiment classifier on the provided tweet dataset. See repo for MANIFEST.json, input data, and verify scripts.",
+      "note": "task_description and criteria are NO LONGER embedded in the Nostr event. They live in the Radicle repo (MANIFEST.json + verify/). The Nostr event is for discovery and action relay only."
     },
 
     "41001": {
@@ -46,7 +47,7 @@
 
     "41002": {
       "name": "WORKER_RESULT",
-      "description": "Worker submits task result with pre-signed claim() and submit_result() actions for its msig. Daemon extracts and relays via worker_msig.execute().",
+      "description": "Worker submits task result with pre-signed claim() and submit_result() actions for its msig. Worker pushes output to Radicle repo before posting this event. Daemon extracts and relays via worker_msig.execute().",
       "direction": "worker → daemon relayer → chain",
       "required_tags": [
         ["job_id",          "<job-id>"],
@@ -54,14 +55,19 @@
         ["claim_action",    "<json-string — signed claim() action at nonce N>"],
         ["claim_sig",       "<hex-encoded-64-byte-ed25519-signature>"],
         ["submit_action",   "<json-string — signed submit_result() action at nonce N+1>"],
-        ["submit_sig",      "<hex-encoded-64-byte-ed25519-signature>"]
+        ["submit_sig",      "<hex-encoded-64-byte-ed25519-signature>"],
+        ["commit_sha",      "<git-commit-sha> — worker's submission commit in the Radicle repo"]
       ],
-      "content": "Result text or KV reference JSON",
+      "optional_tags": [
+        ["branch",      "<branch-name> — e.g. 'worker-abc.near/submission'"],
+        ["artifacts",   "<artifact-path-1>", "<artifact-path-2>", "..."]
+      ],
+      "content": "Brief summary of work completed. Full output is in the Radicle repo (output/ directory at the referenced commit).",
       "content_example": {
-        "summary": "Completed REST API with all endpoints, tests passing at 94% coverage",
-        "artifacts": ["https://github.com/worker/repo/pull/1"]
+        "summary": "Completed sentiment classifier, 92% F1 score on test set",
+        "artifacts": ["output/model.pkl", "output/metrics.json", "output/predictions.csv"]
       },
-      "reference": "See WORKER-SPEC.md for full protocol details"
+      "note": "The worker pushes their output/ directory to the Radicle repo (new branch or direct push) BEFORE posting this Nostr event. The commit_sha tag creates a cryptographic link between the on-chain result and the git state."
     },
 
     "41003": {
@@ -78,8 +84,8 @@
 
     "41004": {
       "name": "FUNDED",
-      "description": "Daemon publishes this after successfully creating + funding an escrow on-chain. Workers watch for this event before signing their claim+submit actions.",
-      "direction": "daemon → workers",
+      "description": "Daemon publishes this after successfully creating + funding an escrow on-chain. Workers watch for this event before claiming. Verifier also watches to know it should seed the Radicle repo.",
+      "direction": "daemon → workers, verifiers",
       "required_tags": [
         ["e",    "<event-id of the kind 41000 that triggered this>"],
         ["p",    "<pubkey of the task poster>"],
@@ -104,6 +110,35 @@
         ["passed",  "<true|false>"]
       ],
       "content": "JSON with settlement details"
+    },
+
+    "41006": {
+      "name": "VERIFIED",
+      "description": "Verifier posts this after running verification on the worker's Radicle commit. Contains the verdict (pass/fail, score, detail). The verifier then signs and submits the verdict to the NEAR contract.",
+      "direction": "verifier → daemon → chain → all",
+      "required_tags": [
+        ["e",           "<event-id of the kind 41000>"],
+        ["job_id",      "<job-id>"],
+        ["verifier",    "<verifier-near-account-id>"],
+        ["verifier_did","<verifier-radicle-did>"],
+        ["commit_sha",  "<git-commit-sha of the worker submission that was verified>"],
+        ["passed",      "<true|false>"],
+        ["score",       "<0-100>"]
+      ],
+      "optional_tags": [
+        ["duration_ms", "<verification execution time in milliseconds>"],
+        ["method",      "<deterministic|test_suite|llm_judge|human_review>"],
+        ["detail",      "<human-readable verdict explanation>"]
+      ],
+      "content": "JSON with full verification result",
+      "content_example": {
+        "passed": true,
+        "score": 92,
+        "method": "test_suite",
+        "duration_ms": 4500,
+        "detail": "All 24 tests passed. F1 score: 0.92 (threshold: 0.85).",
+        "verify_output": "===== test session starts =====\n...24 passed in 3.2s..."
+      }
     }
   },
 
@@ -117,16 +152,19 @@
       ["timeout", "48"],
       ["agent", "agent-abc.near"],
       ["escrow", "escrow.kampouse.near"],
-      ["action", "{\"action\":{\"amount\":\"5000000\",\"criteria\":\"...\",\"job_id\":\"task-2024-0412-001\",\"task_description\":\"Build a REST API\",\"timeout_hours\":48,\"token\":\"usdt.tether-token.near\",\"type\":\"create_escrow\"},\"nonce\":1}"],
+      ["repo_rid", "rad:z4Ybyw4fybeProB6iQx6AVbESsdYn"],
+      ["verifier_did", "did:key:z6Mkfoobar..."],
+      ["action", "{\"action\":{\"amount\":\"5000000\",\"criteria\":\"See repo verify/\",\"job_id\":\"task-2024-0412-001\",\"task_description\":\"See repo MANIFEST.json\",\"task_repo_rid\":\"rad:z4Ybyw4fybeProB6iQx6AVbESsdYn\",\"timeout_hours\":48,\"token\":\"usdt.tether-token.near\",\"type\":\"create_escrow\"},\"nonce\":1}"],
       ["action_sig", "a1b2c3...64-byte-hex-signature"],
       ["fund_action", "{\"action\":{\"amount\":\"5000000\",\"job_id\":\"task-2024-0412-001\",\"type\":\"fund_escrow\"},\"nonce\":2}"],
       ["fund_action_sig", "d4e5f6...64-byte-hex-signature"],
       ["npub", "1aa4d6904eaef430f134025fa0be30d395357c2200530660360c9b82b07c24ca"],
+      ["verifier_fee", "250000"],
       ["score_threshold", "80"],
-      ["category", "coding"],
-      ["skills", "typescript", "nodejs", "rest-api"]
+      ["category", "ml"],
+      ["skills", "python", "nlp", "training"]
     ],
-    "content": "{\"task_description\":\"Build a REST API for user authentication with JWT tokens\",\"criteria\":\"Must include: signup, login, logout endpoints.\"}"
+    "content": "Train a sentiment classifier. Repo contains dataset, training script, and verification tests."
   },
 
   "full_event_example_41002": {
@@ -138,10 +176,31 @@
       ["worker_msig", "worker-msig.near"],
       ["claim_action", "{\"action\":{\"job_id\":\"task-2024-0412-001\",\"type\":\"claim\"},\"nonce\":1}"],
       ["claim_sig", "aa11...64-byte-hex-signature"],
-      ["submit_action", "{\"action\":{\"job_id\":\"task-2024-0412-001\",\"result\":\"{\\\"kv_account\\\":\\\"kv.kampouse.near\\\",\\\"kv_predecessor\\\":\\\"worker-msig.near\\\",\\\"kv_key\\\":\\\"result/task-2024-0412-001\\\"}\",\"type\":\"submit_result\"},\"nonce\":2}"],
-      ["submit_sig", "bb22...64-byte-hex-signature"]
+      ["submit_action", "{\"action\":{\"job_id\":\"task-2024-0412-001\",\"result\":\"92% F1, all tests pass\",\"type\":\"submit_result\"},\"nonce\":2}"],
+      ["submit_sig", "bb22...64-byte-hex-signature"],
+      ["commit_sha", "a1b2c3d4e5f67890abcdef1234567890abcdef12"],
+      ["branch", "worker-bob.near/submission"],
+      ["artifacts", "output/model.pkl", "output/metrics.json"]
     ],
-    "content": "Work completed successfully"
+    "content": "{\"summary\":\"Completed sentiment classifier, 92% F1 score\",\"artifacts\":[\"output/model.pkl\",\"output/metrics.json\"]}"
+  },
+
+  "full_event_example_41006": {
+    "pubkey": "verifier-nostr-pubkey-hex",
+    "created_at": 1712973600,
+    "kind": 41006,
+    "tags": [
+      ["e", "original-41000-event-id"],
+      ["job_id", "task-2024-0412-001"],
+      ["verifier", "verifier-1.jemartel.testnet"],
+      ["verifier_did", "did:key:z6Mkfoobar..."],
+      ["commit_sha", "a1b2c3d4e5f67890abcdef1234567890abcdef12"],
+      ["passed", "true"],
+      ["score", "92"],
+      ["duration_ms", "4500"],
+      ["method", "test_suite"]
+    ],
+    "content": "{\"passed\":true,\"score\":92,\"method\":\"test_suite\",\"duration_ms\":4500,\"detail\":\"All 24 tests passed. F1 score: 0.92.\"}"
   },
 
   "full_event_example_41004": {

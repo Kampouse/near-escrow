@@ -1,93 +1,361 @@
 use anyhow::Result;
-use serde_json::json;
-use ed25519_dalek::{Signer, SigningKey};
+use ed25519_dalek::Signer;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tracing::{info, warn, error};
+
 use crate::config::Config;
-use crate::scorer::{Scorer, Verdict};
+use crate::executor::{DockerExecutor, VerificationResult};
+use crate::nostr::{NostrListener, TaskEvent, WorkerResultEvent, FundedEvent};
+use crate::radicle::RadicleClient;
+use crate::scorer::Scorer;
 use crate::submitter;
 
-/// Off-chain consensus via Nostr (kind 41006 for scores, 41007 for final verdict)
-/// + on-chain submission via `resume_verification_multi`.
-pub struct Consensus {
+/// The main verifier loop.
+///
+/// Watches Nostr for WORKER_RESULT events, clones the Radicle repo,
+/// runs verify.sh in Docker, signs the verdict, submits on-chain,
+/// and posts the result back to Nostr.
+pub struct Verifier {
     config: Config,
-    signing_key: SigningKey,
+    signing_key: ed25519_dalek::SigningKey,
+    nostr: NostrListener,
+    radicle: RadicleClient,
+    executor: DockerExecutor,
     scorer: Scorer,
+    /// Track which tasks we've already processed (job_id → commit_sha)
+    processed: Arc<Mutex<HashMap<String, String>>>,
+    /// Map job_id → repo_rid (from TASK events)
+    task_repos: Arc<Mutex<HashMap<String, String>>>,
+    /// Map job_id → original task event ID (for VERIFIED event linking)
+    task_event_ids: Arc<Mutex<HashMap<String, nostr_sdk::prelude::EventId>>>,
 }
 
-impl Consensus {
-    pub fn new(config: Config, signing_key: SigningKey) -> Self {
+impl Verifier {
+    pub async fn new(config: Config, signing_key: ed25519_dalek::SigningKey) -> Result<Self> {
+        // Ensure work directory exists
+        std::fs::create_dir_all(&config.work_dir)?;
+
+        // Initialize Nostr client
+        let nostr = NostrListener::new(&config.nostr_relays, &config.nostr_key_hex).await?;
+        info!("Nostr client connected to {} relays", config.nostr_relays.len());
+
+        // Initialize Radicle client
+        let radicle = RadicleClient::new(&config.work_dir);
+        info!("Radicle client ready, work_dir: {}", config.work_dir);
+
+        // Initialize Docker executor
+        let executor = DockerExecutor::new(
+            &config.default_image,
+            config.max_timeout_secs,
+            config.max_memory_mb,
+        );
+        DockerExecutor::check_docker()?;
+
+        // Initialize LLM scorer
         let scorer = Scorer::new(config.clone());
-        Self { config, signing_key, scorer }
+
+        Ok(Self {
+            config,
+            signing_key,
+            nostr,
+            radicle,
+            executor,
+            scorer,
+            processed: Arc::new(Mutex::new(HashMap::new())),
+            task_repos: Arc::new(Mutex::new(HashMap::new())),
+            task_event_ids: Arc::new(Mutex::new(HashMap::new())),
+        })
     }
 
-    /// Main loop: poll escrow for verifying escrows, score them, reach consensus, submit.
+    /// Main event loop. Subscribes to Nostr and processes events as they arrive.
     pub async fn run(&self) -> Result<()> {
-        info!("Starting consensus loop...");
+        info!("Starting verifier event loop...");
+        info!("  Verifier: {}", self.config.verifier_account_id);
+        info!("  DID: {}", self.config.verifier_did);
+        info!("  Escrow: {}", self.config.escrow_account);
+
+        let (mut task_rx, mut result_rx, mut funded_rx) = self.nostr.subscribe().await?;
+
         loop {
-            if let Err(e) = self.tick().await {
-                error!("Tick error: {:?}", e);
+            tokio::select! {
+                Some(task) = task_rx.recv() => {
+                    if let Err(e) = self.handle_task_event(task).await {
+                        error!("Error handling TASK event: {:?}", e);
+                    }
+                }
+                Some(result) = result_rx.recv() => {
+                    if let Err(e) = self.handle_worker_result(result).await {
+                        error!("Error handling WORKER_RESULT: {:?}", e);
+                    }
+                }
+                Some(funded) = funded_rx.recv() => {
+                    if let Err(e) = self.handle_funded(funded).await {
+                        error!("Error handling FUNDED event: {:?}", e);
+                    }
+                }
             }
-            tokio::time::sleep(tokio::time::Duration::from_secs(30)).await;
         }
     }
 
-    async fn tick(&self) -> Result<()> {
-        // 1. Find escrows in Verifying state
-        let verifying = submitter::list_verifying(&self.config).await?;
-        if verifying.is_empty() {
-            return Ok(());
-        }
+    /// Handle kind 41000 (TASK) — store repo_rid mapping for later use.
+    async fn handle_task_event(&self, task: TaskEvent) -> Result<()> {
+        let mut repos = self.task_repos.lock().await;
+        let mut event_ids = self.task_event_ids.lock().await;
 
-        for escrow in verifying {
-            let job_id = escrow["job_id"].as_str().unwrap_or("unknown");
-            let data_id = escrow["data_id"].as_str().unwrap_or("");
+        repos.insert(task.job_id.clone(), task.repo_rid.clone());
+        event_ids.insert(task.job_id.clone(), task.event_id);
 
-            if data_id.is_empty() {
-                continue;
-            }
-
-            info!("Processing job: {} (data_id: {})", job_id, data_id);
-
-            // 2. Get task details
-            let details = submitter::get_escrow(&self.config, job_id).await?;
-            let task = details["task_description"].as_str().unwrap_or("");
-            let criteria = details["criteria"].as_str().unwrap_or("");
-            let result = details["result"].as_str().unwrap_or("");
-
-            if result.is_empty() {
-                warn!("No result yet for job {}", job_id);
-                continue;
-            }
-
-            // 3. Score with LLM
-            let verdict = self.scorer.score(task, criteria, result).await?;
-            info!("Scored job {}: {}/100 — {}", job_id, verdict.score, verdict.detail);
-
-            // 4. Sign and publish to Nostr (off-chain consensus)
-            let verdict_json = json!({
-                "score": verdict.score,
-                "passed": verdict.passed,
-                "detail": verdict.detail,
-            }).to_string();
-
-            let scoped_message = format!("{}:{}", data_id, verdict_json);
-            let signature = self.signing_key.sign(scoped_message.as_bytes());
-
-            // 5. Submit on-chain (single verifier mode for now)
-            // In full production: wait for other verifiers' scores via Nostr first
-            self.submit_verdict(data_id, &verdict_json, &signature.to_bytes()).await?;
-        }
+        info!(
+            "📝 Tracked task: {} → repo_rid={}",
+            task.job_id, task.repo_rid
+        );
 
         Ok(())
     }
 
-    async fn submit_verdict(&self, data_id: &str, verdict_json: &str, signature: &[u8]) -> Result<()> {
-        submitter::resume_verification_multi(
-            &self.config,
-            data_id,
-            verdict_json,
-            self.config.verifier_index,
-            signature,
-        ).await
+    /// Handle kind 41004 (FUNDED) — confirm we know about the task, ready for work.
+    async fn handle_funded(&self, funded: FundedEvent) -> Result<()> {
+        let repos = self.task_repos.lock().await;
+        if let Some(rid) = repos.get(&funded.job_id) {
+            info!("💰 Task {} funded, repo_rid={}. Ready to verify.", funded.job_id, rid);
+        } else {
+            warn!("💰 Task {} funded but we don't have a TASK event for it yet", funded.job_id);
+        }
+        Ok(())
+    }
+
+    /// Handle kind 41002 (WORKER_RESULT) — the core verification pipeline.
+    async fn handle_worker_result(&self, result: WorkerResultEvent) -> Result<()> {
+        let job_id = result.job_id.clone();
+        let commit_sha = result.commit_sha.clone();
+
+        // Dedup: skip if we already processed this job+commit
+        {
+            let processed = self.processed.lock().await;
+            if let Some(prev) = processed.get(&job_id) {
+                if *prev == commit_sha {
+                    info!("Skipping already-processed job {} commit {}", job_id, commit_sha);
+                    return Ok(());
+                }
+            }
+        }
+
+        info!("═══════════════════════════════════════════");
+        info!("👷 Worker submitted result for job: {}", job_id);
+        info!("   Commit: {}", commit_sha);
+        info!("   Worker msig: {}", result.worker_msig);
+        info!("═══════════════════════════════════════════");
+
+        // 1. Look up repo_rid for this job
+        let repo_rid = {
+            let repos = self.task_repos.lock().await;
+            repos.get(&job_id).cloned()
+        };
+
+        let repo_rid = match repo_rid {
+            Some(rid) => rid,
+            None => {
+                warn!("No repo_rid found for job {}. Falling back to contract data.", job_id);
+                // Try to get escrow details from contract (task_repo_rid field)
+                let escrow = match submitter::get_escrow(&self.config, &job_id).await {
+                    Ok(e) => e,
+                    Err(e) => {
+                        error!("Failed to get escrow details: {:?}", e);
+                        return Err(e);
+                    }
+                };
+                match escrow.get("task_repo_rid").and_then(|v| v.as_str()) {
+                    Some(rid) => rid.to_string(),
+                    None => {
+                        error!("No task_repo_rid on contract either. Cannot verify.");
+                        return Ok(());
+                    }
+                }
+            }
+        };
+
+        // 2. Clone the Radicle repo
+        let repo_dir = match self.radicle.clone_repo(&repo_rid) {
+            Ok(dir) => dir,
+            Err(e) => {
+                error!("Failed to clone repo {}: {:?}", repo_rid, e);
+                return Ok(());
+            }
+        };
+
+        // 3. Checkout the worker's commit
+        if !commit_sha.is_empty() {
+            if let Err(e) = self.radicle.checkout_commit(&repo_dir, &commit_sha) {
+                error!("Failed to checkout commit {}: {:?}", commit_sha, e);
+                // Try branch checkout as fallback
+                if let Some(ref branch) = result.branch {
+                    if let Err(e2) = self.radicle.checkout_branch(&repo_dir, branch) {
+                        error!("Failed to checkout branch {} either: {:?}", branch, e2);
+                        return Ok(());
+                    }
+                } else {
+                    return Ok(());
+                }
+            }
+        }
+
+        // 4. Check if verify.sh exists — determines verification method
+        let has_verify_script = self.radicle.has_verify_script(&repo_dir);
+
+        // 5. Read MANIFEST.json to determine verification method
+        let manifest: Option<serde_json::Value> = self.radicle.has_manifest(&repo_dir)
+            .then(|| self.radicle.read_file(&repo_dir, "MANIFEST.json").ok())
+            .flatten()
+            .and_then(|c| serde_json::from_str(&c).ok());
+
+        let verify_method = manifest
+            .as_ref()
+            .and_then(|m| m.get("verification"))
+            .and_then(|v| v.get("method"))
+            .and_then(|m| m.as_str())
+            .unwrap_or("test_suite");
+
+        let verification_result = match verify_method {
+            "test_suite" | "deterministic" if has_verify_script => {
+                // Read execution runtime from manifest
+                let runtime_image = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("execution"))
+                    .and_then(|e| e.get("runtime"))
+                    .and_then(|r| r.as_str())
+                    .unwrap_or(&self.config.default_image);
+
+                self.executor.verify_with_image(&repo_dir, runtime_image)?
+            }
+            "llm_judge" => {
+                // Fall back to LLM scoring (no verify.sh needed)
+                let task_desc = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("name"))
+                    .and_then(|n| n.as_str())
+                    .unwrap_or("Task");
+
+                let criteria = manifest
+                    .as_ref()
+                    .and_then(|m| m.get("verification"))
+                    .and_then(|v| v.get("criteria"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("Quality of work");
+
+                // Read worker output
+                let output_text = self.radicle.read_file(&repo_dir, "output/result.json")
+                    .unwrap_or_else(|_| self.radicle.read_file(&repo_dir, "output/solution.py")
+                    .unwrap_or_else(|_| result.summary.clone()));
+
+                let verdict = self.scorer.score(task_desc, criteria, &output_text).await?;
+                VerificationResult {
+                    passed: verdict.passed,
+                    exit_code: if verdict.passed { 0 } else { 1 },
+                    stdout: verdict.detail.clone(),
+                    stderr: String::new(),
+                    duration_ms: 0,
+                    method: "llm_judge".into(),
+                }
+            }
+            _ => {
+                warn!("No verification method available for job {}", job_id);
+                return Ok(());
+            }
+        };
+
+        // 6. Compute score
+        let score = if verification_result.passed {
+            manifest
+                .as_ref()
+                .and_then(|m| m.get("verification"))
+                .and_then(|v| v.get("threshold"))
+                .and_then(|t| t.as_u64())
+                .map(|t| t as u8)
+                .unwrap_or(100) // If passed, default to 100
+        } else {
+            0
+        };
+
+        info!("📊 Verification result: passed={} score={} method={}",
+            verification_result.passed, score, verification_result.method);
+
+        // 7. Sign the verdict
+        let verdict_json = serde_json::json!({
+            "score": score,
+            "passed": verification_result.passed,
+            "detail": &verification_result.stdout[..verification_result.stdout.len().min(1000)],
+            "method": verification_result.method,
+            "commit_sha": commit_sha,
+        }).to_string();
+
+        let scoped_message = format!("{}:{}", job_id, verdict_json);
+        let signature = self.signing_key.sign(scoped_message.as_bytes());
+
+        // 8. Submit on-chain
+        // Get the data_id from the escrow (needed for resume_verification_multi)
+        let escrow = match submitter::get_escrow(&self.config, &job_id).await {
+            Ok(e) => e,
+            Err(e) => {
+                error!("Failed to get escrow for on-chain submit: {:?}", e);
+                return Ok(());
+            }
+        };
+
+        let data_id = escrow.get("data_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if !data_id.is_empty() {
+            match submitter::resume_verification_multi(
+                &self.config,
+                data_id,
+                &verdict_json,
+                self.config.verifier_index,
+                &signature.to_bytes(),
+            ).await {
+                Ok(()) => info!("✅ Verdict submitted on-chain for job {}", job_id),
+                Err(e) => error!("❌ Failed to submit verdict on-chain: {:?}", e),
+            }
+        } else {
+            warn!("No data_id for job {}, skipping on-chain submission", job_id);
+        }
+
+        // 9. Post VERIFIED event to Nostr
+        let original_event_id = {
+            let event_ids = self.task_event_ids.lock().await;
+            event_ids.get(&job_id).copied()
+        };
+
+        if let Some(event_id) = original_event_id {
+            if let Err(e) = self.nostr.post_verified(
+                &event_id,
+                &job_id,
+                &self.config.verifier_account_id,
+                &self.config.verifier_did,
+                &commit_sha,
+                verification_result.passed,
+                score,
+                &verification_result.method,
+                verification_result.duration_ms,
+                &verification_result.stdout[..verification_result.stdout.len().min(500)],
+            ).await {
+                error!("Failed to post VERIFIED to Nostr: {:?}", e);
+            }
+        }
+
+        // 10. Mark as processed
+        {
+            let mut processed = self.processed.lock().await;
+            processed.insert(job_id.clone(), commit_sha.clone());
+        }
+
+        info!("═══════════════════════════════════════════");
+        info!("Done with job {}", job_id);
+        info!("═══════════════════════════════════════════");
+
+        Ok(())
     }
 }

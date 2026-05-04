@@ -1,42 +1,39 @@
 # Current Session State
 
-## What's Running
-- **PID 57144** — nearcore release build with ACTION-FAILED + CONTRACT-LOG instrumentation
-  - Command: `cargo build -p neard --release --features "sandbox,nightly,json_rpc"`
-  - Working dir: `/Users/asil/.openclaw/workspace/nearcore`
-  - Session: `proc_21e74e420f2d`
-  - Started ~7 min ago, expected total ~11 min
+## Test Results (Real neard — protocol 152)
 
-## What To Do When Build Finishes
-1. Swap binary:
-   ```bash
-   cp /Users/asil/.openclaw/workspace/nearcore/target/release/neard \
-      /Users/asil/.openclaw/workspace/near-escrow/target/debug/build/near-sandbox-075fa242981621a0/out/.near/near-sandbox-2.11.0/near-sandbox
-   ```
-2. Clear debug log: `> /tmp/nearcore-yield-debug.log`
-3. Run test:
-   ```bash
-   cd /Users/asil/.openclaw/workspace/near-escrow
-   cargo test --manifest-path tests/integration/Cargo.toml -- test_full_happy_path --exact --nocapture 2>&1 | tail -60
-   ```
-4. Read debug log:
-   ```bash
-   grep -E 'ACTION-FAILED|CONTRACT-LOG' /tmp/nearcore-yield-debug.log
-   ```
-5. The ACTION-FAILED line will show the exact WASM panic message
-6. The CONTRACT-LOG lines will show the contract's env::log_str output
+### Integration Tests: 73 pass, 0 fail, 2 ignored (156s)
+- Full happy path (create → fund → claim → submit → verify → settle) ✅
+- Verification failure (agent refund) ✅
+- Settlement retry (FT pause/unpause) ✅
+- Timeout refunds, double-claim guards, score consistency ✅
+- Worker FT withdraw, worker NEAR withdraw ✅
+- Yield/resume pipeline fully functional with real neard
 
-## Current Hypothesis
-Nearcore yield/resume pipeline is CORRECT. The problem is inside the WASM:
-- verification_callback fires at runtime level but panics
-- State reverts (verdict stays null, status stays "Verifying")
-- Most likely panic in `_settle_escrow()` or in the callback's data parsing
+### E2E Tests: (not re-run, but same contract logic)
 
-## Key Evidence
-- Debug log shows: YIELD-STORE ✅ → YIELD-RESUME FOUND ✅ → APPLY-RECEIPT verification_callback ✅
-- But: NO settle_callback, NO ft_transfer from settlement, verdict=null
-- Every APPLY-RECEIPT appears twice (logging artifact, not double execution)
+## Root Cause of Previous Failures
 
-## Files Modified (uncommitted)
-- `/Users/asil/.openclaw/workspace/nearcore/runtime/runtime/src/lib.rs` — instrumentation patches
-- `/Users/asil/.openclaw/workspace/near-escrow/YIELD-BUG-FINDINGS.md` — findings doc
+The bundled `near-sandbox` binary (v2.0.0, Aug 2024) downloaded by near-workspaces
+does NOT properly support `promise_yield` / `promise_yield_resume`. This caused
+all yield-dependent tests to fail — escrows stuck at "Verifying" forever.
+
+**Fix**: Use the local neard build (protocol 152) via wrapper script:
+```bash
+export NEAR_SANDBOX_BIN_PATH=/tmp/near-sandbox-wrapper
+cargo test -p integration-tests --test integration
+```
+
+The wrapper at `/tmp/near-sandbox-wrapper` is a thin shell script that delegates
+to `/Users/asil/.openclaw/workspace/nearcore/target/release/neard`.
+
+## Known Issues
+- Test suite is slow (~156s) because each test spins up a fresh neard instance
+- near-workspaces 0.16.0 has no `neard_bin()` method — env var workaround needed
+- The 2 ignored tests need investigation (not yield-related)
+
+## What's Still Missing for Production
+1. `withdraw_balance` for internal wallet workers — implemented but needs audit
+2. No standalone verifier service
+3. No deploy pipeline (build.sh)
+4. No agent cancel after worker claims (timeout-only)

@@ -48,9 +48,9 @@ Each layer does one thing. No REST API needed — Nostr is the coordination laye
          │              │              │
     ┌────┴───┐    ┌────┴───┐    ┌────┴────┐
     │ Agents  │    │Workers │    │  NEAR   │
-    │(create  │    │(clone, │    │Contract │
+    │(create  │    │(fork,  │    │Contract │
     │ repos,  │    │ work,  │    │(settle) │
-    │ post    │    │ push)  │    │         │
+    │ post    │    │ patch) │    │         │
     └────────┘    └────────┘    └─────────┘
          │              │
     ┌────┴──────────────┴───┐
@@ -76,7 +76,7 @@ Each layer does one thing. No REST API needed — Nostr is the coordination laye
 | Kind | Name | Direction | Description |
 |------|------|-----------|-------------|
 | 41000 | TASK | agent → relayer → chain | Task announcement with signed action + repo_rid |
-| 41002 | WORKER_RESULT | worker → relayer → chain | Worker submits result with signed action + commit_sha |
+| 41002 | WORKER_RESULT | worker → relayer → chain | Worker submits result with signed action + patch_id |
 | 41003 | ACTION | agent → relayer → chain | Generic signed action (fund, cancel, withdraw) |
 | 41004 | FUNDED | daemon → workers, verifiers | Escrow created + funded on-chain |
 | 41005 | CONFIRMED | daemon → all | Settlement complete |
@@ -161,7 +161,6 @@ Agent               Nostr Relay          Relayer Daemon        NEAR
   │                    │                      │                 │
   │ rad id update      │                      │                 │
   │  --allow <verifier_DID>                  │                 │
-  │  --allow <worker_DID>                    │                 │
   │                    │                      │                 │
   │ rad push           │                      │                 │
   │ (to verifier seed) │                      │                 │
@@ -194,36 +193,51 @@ Worker              Nostr Relay          Verifier           NEAR
   │ (from verifier)    │                    │                 │
   │<────────────────────────────────────────│                 │
   │                    │                    │                 │
+  │ rad fork           │                    │                 │
+  │ (creates worker's  │                    │                 │
+  │  own copy of repo) │                    │                 │
+  │                    │                    │                 │
   │ (read MANIFEST.json)                    │                 │
   │ (execute per execution spec)            │                 │
   │ (produce output/)                       │                 │
   │                    │                    │                 │
-  │ rad push           │                    │                 │
-  │ (output/ branch)   │                    │                 │
+  │ git commit output/ │                    │                 │
+  │ (to worker's fork) │                    │                 │
+  │ rad push (fork)    │                    │                 │
+  │────────────────────────────────────────>│                 │
+  │                    │                    │                 │
+  │ rad patch          │                    │                 │
+  │ (submit patch from │                    │                 │
+  │  fork back to      │                    │                 │
+  │  original repo)    │                    │                 │
   │────────────────────────────────────────>│                 │
   │                    │                    │                 │
   │ Nostr kind 41002   │                    │                 │
   │ (signed claim +    │                    │                 │
-  │  submit + commit_sha)                   │                 │
+  │  submit + patch_id)                     │                 │
   │───────────────────>│                    │                 │
   │                    │ kind 41002         │                 │
   │                    │─────────────────────────────────────>│
   │                    │                    │ claim + submit  │
   │                    │                    │                 │
-```
 
+```
 ### 3. Verifier Checks & Signs
 
 ```
 Verifier            Nostr Relay          NEAR
   │                    │                    │
   │ See kind 41002     │                    │
+  │ (extract patch_id) │                    │
   │<───────────────────│                    │
   │                    │                    │
-  │ rad checkout       │                    │
-  │  <commit_sha>      │                    │
+  │ rad patch checkout │                    │
+  │  <patch_id>        │                    │
+  │ (gets worker code) │                    │
   │                    │                    │
   │ docker run         │                    │
+  │  -v agent_main:/task/verify (read-only) │
+  │  -v patch_co:/task/output (read-only)   │
   │  verify.sh         │                    │
   │  (sandboxed)       │                    │
   │                    │                    │
@@ -243,6 +257,12 @@ Verifier            Nostr Relay          NEAR
 ```
 
 ## Verification Methods
+
+The verifier mounts two separate trees into the verification container:
+- **verify/** (from agent's main branch) — the agent's test logic, read-only
+- **output/** (from worker's patch checkout) — the worker's deliverable, read-only
+
+This separation ensures the worker cannot tamper with verification logic.
 
 ### Deterministic (exit code + hash comparison)
 ```bash
@@ -295,7 +315,7 @@ Trust: social.
 Runs a Radicle node that:
 - Hosts private task repos (agent creates, verifier seeds)
 - Syncs with workers via Radicle P2P protocol
-- Enforces access control (allow-lists via DIDs)
+- Workers fork repos and submit patches (never added to allow-list)
 - Provides git push/pull over Radicle protocol
 - Acts as a seed node for always-on availability
 
@@ -315,7 +335,7 @@ No REST API. All coordination through Nostr events.
 ### executor (Container runtime)
 
 Spawns Docker/Podman containers to run verification:
-- Mounts task repo (read-only) + worker output (read-only) into container
+- Mounts agent's verify/ from main branch (read-only) + worker's output/ from patch checkout (read-only) into container
 - Enforces resource limits (memory, CPU, timeout, no network)
 - Captures stdout/stderr/exit code
 - Returns structured result: {passed, exit_code, output, duration}
@@ -332,7 +352,7 @@ Manages ed25519 key pair registered with the NEAR escrow contract:
 
 Local state not on-chain:
 - escrow_id ↔ repo_rid mapping (from Nostr events)
-- Verification results (pass/fail, logs, duration, commit_sha)
+- Verification results (pass/fail, logs, duration, patch_id)
 - Verifier reputation (accuracy, response time)
 - Repo cleanup scheduling (TTL after settlement)
 
@@ -424,7 +444,8 @@ Trusted:                    Untrusted:
   • NEAR contract             • Worker output (validated by verify.sh)
   • Radicle protocol          • LLM judge (can be gamed)
   • Nostr event signatures    • External network (disabled in sandbox)
-  • Agent input (in repo)
+  • Agent verify/ (main branch, worker cannot modify)
+  • Worker submits via fork+patch (never touches main repo)
 ```
 
 ### Sandbox Guarantees
@@ -470,7 +491,7 @@ Anyone can run a verifier service. The agent chooses which verifier to use when 
 - **Price** — verifier_fee_bps (basis points of escrow amount)
 - **Trust** — reputation score (accuracy history)
 
-Workers discover verifiers via Nostr (kind 41000 events include verifier_did). They clone from any verifier node seeding the repo.
+Workers discover verifiers via Nostr (kind 41000 events include verifier_did). They clone from any verifier node seeding the repo, then fork and submit patches.
 
 ## Future: Splitting Host and Verifier
 
@@ -487,7 +508,7 @@ But for v1, the verifier does everything: host, verify, sign, earn the full fee.
 | Question | Decision |
 |----------|----------|
 | Radicle DIDs ↔ NEAR accounts | Don't map. Separate systems, linked by escrow. |
-| Worker authentication | NEAR signature → Radicle access (verifier adds DID to allow-list after on-chain claim) |
+| Worker authentication | Fork+patch model. Worker never added to repo allow-list. Forks repo, commits to fork, submits patch back. |
 | Repo cleanup | 30-day TTL after settlement. Logs kept indefinitely in SQLite. |
 | Disputes | None v1. Timeouts are the escape hatch. Pick the right verification method. |
 | LLM judge model | Verifier-internal. Agent specifies model in MANIFEST.json. |
@@ -495,4 +516,5 @@ But for v1, the verifier does everything: host, verify, sign, earn the full fee.
 | Rate limiting | Storage deposit + worker stake already in contract. Economic disincentive. |
 | Coordination | Nostr only. No REST API. |
 | Verifier discovery | Nostr kind 41000 events (verifier_did tag). |
-| Result provenance | commit_sha in kind 41002 tags links on-chain result to git state. |
+| Result provenance | patch_id in kind 41002 tags links on-chain result to Radicle patch. |
+| Fork+patch vs direct push | Workers fork the repo and submit patches. Agent NEVER adds worker DID to repo. Verifier checks out patch via `rad patch checkout <patch_id>` and mounts verify/ from main branch separately. Prevents worker from tampering with verification logic. |

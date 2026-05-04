@@ -76,7 +76,8 @@ pub struct WorkerResultEvent {
     pub pubkey: String,
     pub job_id: String,
     pub worker_msig: String,
-    pub commit_sha: String,
+    /// Radicle patch ID — references the worker's submitted patch (from `rad patch`).
+    pub patch_id: String,
     pub branch: Option<String>,
     pub summary: String,
 }
@@ -92,7 +93,7 @@ impl WorkerResultEvent {
             pubkey: event.pubkey.to_hex(),
             job_id: get_tag(&event.tags, "job_id")?,
             worker_msig: get_tag(&event.tags, "worker_msig")?,
-            commit_sha: get_tag(&event.tags, "commit_sha").unwrap_or_default(),
+            patch_id: get_tag(&event.tags, "patch_id").unwrap_or_default(),
             branch: get_tag(&event.tags, "branch"),
             summary: event.content.clone(),
         })
@@ -178,7 +179,7 @@ impl NostrListener {
                         }
                     } else if kind == 41002 {
                         if let Some(result) = WorkerResultEvent::parse(&event) {
-                            info!("WORKER_RESULT: job_id={} commit={}", result.job_id, result.commit_sha);
+                            info!("WORKER_RESULT: job_id={} patch_id={}", result.job_id, result.patch_id);
                             let _ = result_tx.send(result).await;
                         }
                     } else if kind == 41004 {
@@ -201,7 +202,7 @@ impl NostrListener {
         job_id: &str,
         verifier_account: &str,
         verifier_did: &str,
-        commit_sha: &str,
+        patch_id: &str,
         passed: bool,
         score: u8,
         method: &str,
@@ -232,8 +233,8 @@ impl NostrListener {
             [verifier_did],
         ))
         .tag(Tag::custom(
-            TagKind::Custom("commit_sha".into()),
-            [commit_sha],
+            TagKind::Custom("patch_id".into()),
+            [patch_id],
         ))
         .tag(Tag::custom(
             TagKind::Custom("passed".into()),

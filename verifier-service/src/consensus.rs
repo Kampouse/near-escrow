@@ -25,7 +25,7 @@ pub struct Verifier {
     radicle: RadicleClient,
     executor: DockerExecutor,
     scorer: Scorer,
-    /// Track which tasks we've already processed (job_id → commit_sha)
+    /// Track which tasks we've already processed (job_id → patch_id)
     processed: Arc<Mutex<HashMap<String, String>>>,
     /// Map job_id → repo_rid (from TASK events)
     task_repos: Arc<Mutex<HashMap<String, String>>>,
@@ -128,16 +128,24 @@ impl Verifier {
     }
 
     /// Handle kind 41002 (WORKER_RESULT) — the core verification pipeline.
+    ///
+    /// Fork+patch flow:
+    ///   1. Worker forks the agent's repo, commits output/ to their fork
+    ///   2. Worker submits a Radicle patch (rad patch), posts kind 41002 with patch_id
+    ///   3. Verifier clones the agent's repo, checks out the worker's patch
+    ///   4. Verifier runs agent's verify/ against worker's output/ in Docker sandbox
+    ///
+    /// The worker never has push access to the agent's repo, so verify/ is tamper-proof.
     async fn handle_worker_result(&self, result: WorkerResultEvent) -> Result<()> {
         let job_id = result.job_id.clone();
-        let commit_sha = result.commit_sha.clone();
+        let patch_id = result.patch_id.clone();
 
-        // Dedup: skip if we already processed this job+commit
+        // Dedup: skip if we already processed this job+patch
         {
             let processed = self.processed.lock().await;
             if let Some(prev) = processed.get(&job_id) {
-                if *prev == commit_sha {
-                    info!("Skipping already-processed job {} commit {}", job_id, commit_sha);
+                if *prev == patch_id {
+                    info!("Skipping already-processed job {} patch {}", job_id, patch_id);
                     return Ok(());
                 }
             }
@@ -145,7 +153,7 @@ impl Verifier {
 
         info!("═══════════════════════════════════════════");
         info!("👷 Worker submitted result for job: {}", job_id);
-        info!("   Commit: {}", commit_sha);
+        info!("   Patch ID: {}", patch_id);
         info!("   Worker msig: {}", result.worker_msig);
         info!("═══════════════════════════════════════════");
 
@@ -177,7 +185,7 @@ impl Verifier {
             }
         };
 
-        // 2. Clone the Radicle repo
+        // 2. Clone the agent's Radicle repo (contains MANIFEST, input/, verify/)
         let repo_dir = match self.radicle.clone_repo(&repo_rid) {
             Ok(dir) => dir,
             Err(e) => {
@@ -186,11 +194,22 @@ impl Verifier {
             }
         };
 
-        // 3. Checkout the worker's commit
-        if !commit_sha.is_empty() {
-            if let Err(e) = self.radicle.checkout_commit(&repo_dir, &commit_sha) {
-                error!("Failed to checkout commit {}: {:?}", commit_sha, e);
-                // Try branch checkout as fallback
+        // 3. Save the agent's base commit (main/master HEAD) for verify/ reference
+        let base_commit = match self.radicle.base_commit(&repo_dir) {
+            Ok(sha) => sha,
+            Err(e) => {
+                warn!("Could not determine base commit: {:?}. Using current HEAD.", e);
+                self.radicle.head_commit(&repo_dir).unwrap_or_default()
+            }
+        };
+        info!("Agent base commit: {}", base_commit);
+
+        // 4. Checkout the worker's patch — creates a local branch with the worker's output
+        let patch_commit = match self.radicle.checkout_patch(&repo_dir, &patch_id) {
+            Ok(sha) => sha,
+            Err(e) => {
+                error!("Failed to checkout patch {}: {:?}", patch_id, e);
+                // Fallback: try branch checkout if patch_id looks like a commit SHA
                 if let Some(ref branch) = result.branch {
                     if let Err(e2) = self.radicle.checkout_branch(&repo_dir, branch) {
                         error!("Failed to checkout branch {} either: {:?}", branch, e2);
@@ -199,17 +218,20 @@ impl Verifier {
                 } else {
                     return Ok(());
                 }
+                String::new()
             }
-        }
+        };
 
-        // 4. Check if verify.sh exists — determines verification method
-        let has_verify_script = self.radicle.has_verify_script(&repo_dir);
-
-        // 5. Read MANIFEST.json to determine verification method
-        let manifest: Option<serde_json::Value> = self.radicle.has_manifest(&repo_dir)
-            .then(|| self.radicle.read_file(&repo_dir, "MANIFEST.json").ok())
-            .flatten()
+        // 5. Read MANIFEST.json from the agent's base commit (not the worker's patch!)
+        let manifest: Option<serde_json::Value> = self.radicle.read_file_at_commit(
+            &repo_dir, &base_commit, "MANIFEST.json"
+        ).ok()
             .and_then(|c| serde_json::from_str(&c).ok());
+
+        // 6. Check if verify.sh exists in the agent's base commit
+        let has_verify_script = self.radicle.read_file_at_commit(
+            &repo_dir, &base_commit, "verify/verify.sh"
+        ).is_ok();
 
         let verify_method = manifest
             .as_ref()
@@ -218,9 +240,14 @@ impl Verifier {
             .and_then(|m| m.as_str())
             .unwrap_or("test_suite");
 
+        // The patch checkout dir contains the worker's output/ — we pass it
+        // to the executor so it mounts verify/ from base and output/ from patch.
+        let patch_dir = repo_dir.as_path();
+
         let verification_result = match verify_method {
             "test_suite" | "deterministic" if has_verify_script => {
-                // Read execution runtime from manifest
+                // First, checkout base commit to get clean verify/ for docker mount
+                self.radicle.checkout_commit(&repo_dir, &base_commit)?;
                 let runtime_image = manifest
                     .as_ref()
                     .and_then(|m| m.get("execution"))
@@ -228,7 +255,7 @@ impl Verifier {
                     .and_then(|r| r.as_str())
                     .unwrap_or(&self.config.default_image);
 
-                self.executor.verify_with_image(&repo_dir, runtime_image)?
+                self.executor.verify_with_image(&repo_dir, runtime_image, Some(patch_dir))?
             }
             "llm_judge" => {
                 // Fall back to LLM scoring (no verify.sh needed)
@@ -245,7 +272,7 @@ impl Verifier {
                     .and_then(|c| c.as_str())
                     .unwrap_or("Quality of work");
 
-                // Read worker output
+                // Read worker output from the patch checkout
                 let output_text = self.radicle.read_file(&repo_dir, "output/result.json")
                     .unwrap_or_else(|_| self.radicle.read_file(&repo_dir, "output/solution.py")
                     .unwrap_or_else(|_| result.summary.clone()));
@@ -266,7 +293,7 @@ impl Verifier {
             }
         };
 
-        // 6. Compute score
+        // 7. Compute score
         let score = if verification_result.passed {
             manifest
                 .as_ref()
@@ -282,20 +309,19 @@ impl Verifier {
         info!("📊 Verification result: passed={} score={} method={}",
             verification_result.passed, score, verification_result.method);
 
-        // 7. Sign the verdict
+        // 8. Sign the verdict
         let verdict_json = serde_json::json!({
             "score": score,
             "passed": verification_result.passed,
             "detail": &verification_result.stdout[..verification_result.stdout.len().min(1000)],
             "method": verification_result.method,
-            "commit_sha": commit_sha,
+            "patch_id": patch_id,
         }).to_string();
 
         let scoped_message = format!("{}:{}", job_id, verdict_json);
         let signature = self.signing_key.sign(scoped_message.as_bytes());
 
-        // 8. Submit on-chain
-        // Get the data_id from the escrow (needed for resume_verification_multi)
+        // 9. Submit on-chain
         let escrow = match submitter::get_escrow(&self.config, &job_id).await {
             Ok(e) => e,
             Err(e) => {
@@ -323,7 +349,7 @@ impl Verifier {
             warn!("No data_id for job {}, skipping on-chain submission", job_id);
         }
 
-        // 9. Post VERIFIED event to Nostr
+        // 10. Post VERIFIED event to Nostr
         let original_event_id = {
             let event_ids = self.task_event_ids.lock().await;
             event_ids.get(&job_id).copied()
@@ -335,7 +361,7 @@ impl Verifier {
                 &job_id,
                 &self.config.verifier_account_id,
                 &self.config.verifier_did,
-                &commit_sha,
+                &patch_id,
                 verification_result.passed,
                 score,
                 &verification_result.method,
@@ -346,10 +372,10 @@ impl Verifier {
             }
         }
 
-        // 10. Mark as processed
+        // 11. Mark as processed
         {
             let mut processed = self.processed.lock().await;
-            processed.insert(job_id.clone(), commit_sha.clone());
+            processed.insert(job_id.clone(), patch_id.clone());
         }
 
         info!("═══════════════════════════════════════════");

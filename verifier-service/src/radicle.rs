@@ -46,6 +46,39 @@ impl RadicleClient {
         Ok(())
     }
 
+    /// Checkout a Radicle patch by ID.
+    /// Creates a local branch from the patch for inspection.
+    /// Returns the commit SHA of the patch HEAD.
+    pub fn checkout_patch(&self, repo_dir: &Path, patch_id: &str) -> Result<String> {
+        info!("Checking out patch {} in {}...", patch_id, repo_dir.display());
+        // `rad patch checkout` creates a local branch from the patch
+        self.run_rad(repo_dir, &["patch", "checkout", patch_id])?;
+
+        // Get the HEAD commit of the checked-out patch
+        let head = self.head_commit(repo_dir)?;
+        info!("Patch {} checked out at commit {}", patch_id, head);
+        Ok(head)
+    }
+
+    /// Get the base commit (main/master HEAD) of the repo.
+    /// Used to read verify/ from the agent's original branch.
+    pub fn base_commit(&self, repo_dir: &Path) -> Result<String> {
+        // Try main first, then master
+        let output = self.run_git_with_output(repo_dir, &["rev-parse", "main"])?;
+        let sha = output.trim().to_string();
+        if !sha.is_empty() {
+            return Ok(sha);
+        }
+        let output = self.run_git_with_output(repo_dir, &["rev-parse", "master"])?;
+        Ok(output.trim().to_string())
+    }
+
+    /// Read a file from the repo at a specific commit (without checking out).
+    pub fn read_file_at_commit(&self, repo_dir: &Path, commit_sha: &str, path: &str) -> Result<String> {
+        let output = self.run_git_with_output(repo_dir, &["show", &format!("{}:{}", commit_sha, path)])?;
+        Ok(output)
+    }
+
     /// Checkout a specific branch.
     pub fn checkout_branch(&self, repo_dir: &Path, branch: &str) -> Result<()> {
         info!("Checking out branch {} in {}...", branch, repo_dir.display());

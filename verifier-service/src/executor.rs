@@ -42,8 +42,9 @@ impl DockerExecutor {
     }
 
     /// Run verify.sh in a sandboxed Docker container.
-    /// Mounts the task repo (read-only) into the container.
-    pub fn verify(&self, repo_dir: &Path) -> Result<VerificationResult> {
+    /// Uses two mounts: agent repo (verify/) read-only, patch checkout (output/) read-only.
+    /// This prevents the worker from tampering with verify.sh.
+    pub fn verify(&self, repo_dir: &Path, patch_dir: Option<&Path>) -> Result<VerificationResult> {
         // Read manifest for execution config
         let manifest = read_manifest(repo_dir).ok();
         let verify_config = manifest
@@ -84,20 +85,39 @@ impl DockerExecutor {
 
         let start = Instant::now();
 
+        // Build docker args with two mounts:
+        //   - Agent repo (main branch) mounted at /task — contains MANIFEST, input/, verify/
+        //   - Worker patch checkout mounted at /output — contains worker's output/
+        // This ensures verify/ comes from the agent, not the worker.
+        let mut docker_args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network".to_string(), "none".to_string(),
+            "--memory".to_string(), format!("{}m", memory_mb),
+            "--cpus".to_string(), "2".to_string(),
+            "--read-only".to_string(),
+            "--tmpfs".to_string(), "/tmp:size=100m".to_string(),
+            "-v".to_string(), format!("{}:/task:ro", repo_dir.display()),
+        ];
+
+        // If we have a separate patch checkout, mount it as /task/output
+        if let Some(pdir) = patch_dir {
+            let output_path = pdir.join("output");
+            if output_path.exists() {
+                docker_args.push("-v".to_string());
+                docker_args.push(format!("{}:/task/output:ro", output_path.display()));
+                info!("Two-mount: verify/ from agent repo, output/ from patch checkout");
+            }
+        }
+
+        docker_args.extend([
+            "-w".to_string(), "/task".to_string(),
+            self.default_image.clone(),
+            "bash".to_string(), "verify/verify.sh".to_string(),
+        ]);
+
         let output = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network", "none",
-                "--memory", &format!("{}m", memory_mb),
-                "--cpus", "2",
-                "--read-only",
-                "--tmpfs", "/tmp:size=100m",
-                "-v", &format!("{}:/task:ro", repo_dir.display()),
-                "-w", "/task",
-                &self.default_image,
-                "bash", "verify/verify.sh",
-            ])
+            .args(&docker_args)
             .output()
             .context("Failed to run docker container")?;
 
@@ -105,7 +125,6 @@ impl DockerExecutor {
         let exit_code = output.status.code().unwrap_or(-1);
         let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
         let passed = exit_code == 0;
 
         if passed {
@@ -126,7 +145,8 @@ impl DockerExecutor {
     }
 
     /// Run verification with a specific container image (from MANIFEST.json execution.runtime).
-    pub fn verify_with_image(&self, repo_dir: &Path, image: &str) -> Result<VerificationResult> {
+    /// Uses two mounts: agent repo for verify/, patch checkout for output/.
+    pub fn verify_with_image(&self, repo_dir: &Path, image: &str, patch_dir: Option<&Path>) -> Result<VerificationResult> {
         let verify_script = repo_dir.join("verify").join("verify.sh");
 
         if !verify_script.exists() {
@@ -144,20 +164,35 @@ impl DockerExecutor {
 
         let start = Instant::now();
 
+        // Build docker args with two mounts
+        let mut docker_args = vec![
+            "run".to_string(),
+            "--rm".to_string(),
+            "--network".to_string(), "none".to_string(),
+            "--memory".to_string(), format!("{}m", self.default_memory_mb),
+            "--cpus".to_string(), "2".to_string(),
+            "--read-only".to_string(),
+            "--tmpfs".to_string(), "/tmp:size=100m".to_string(),
+            "-v".to_string(), format!("{}:/task:ro", repo_dir.display()),
+        ];
+
+        // Mount worker's output/ from patch checkout
+        if let Some(pdir) = patch_dir {
+            let output_path = pdir.join("output");
+            if output_path.exists() {
+                docker_args.push("-v".to_string());
+                docker_args.push(format!("{}:/task/output:ro", output_path.display()));
+            }
+        }
+
+        docker_args.extend([
+            "-w".to_string(), "/task".to_string(),
+            image.to_string(),
+            "bash".to_string(), "verify/verify.sh".to_string(),
+        ]);
+
         let output = Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--network", "none",
-                "--memory", &format!("{}m", self.default_memory_mb),
-                "--cpus", "2",
-                "--read-only",
-                "--tmpfs", "/tmp:size=100m",
-                "-v", &format!("{}:/task:ro", repo_dir.display()),
-                "-w", "/task",
-                image,
-                "bash", "verify/verify.sh",
-            ])
+            .args(&docker_args)
             .output()
             .context("Failed to run docker container")?;
 

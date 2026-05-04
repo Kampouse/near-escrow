@@ -1387,6 +1387,76 @@ escrow.submissions.push(Submission {
         true
     }
 
+    /// Single-verifier resume — convenience wrapper for the common case
+    /// where only one verifier is registered. Signs the verdict with the
+    /// verifier's ed25519 key and resumes the yield.
+    ///
+    /// Args:
+    /// - data_id_hex: 64-char hex of the yield data_id
+    /// - verdict_json: JSON string like {"score":85,"passed":true,"detail":"..."}
+    /// - verifier_index: index into verifier_set
+    /// - signature: 64-byte ed25519 signature over "{data_id_hex}:{verdict_json}"
+    pub fn resume_verification(
+        &mut self,
+        data_id_hex: String,
+        verdict_json: String,
+        verifier_index: u8,
+        signature: Vec<u8>,
+    ) -> bool {
+        // Must have verifier_set configured
+        assert!(!self.verifier_set.is_empty(), "No verifier set configured");
+
+        // Validate index
+        let idx = verifier_index as usize;
+        assert!(idx < self.verifier_set.len(), "Invalid verifier index");
+        let verifier = &self.verifier_set[idx];
+        assert!(verifier.active, "Verifier is not active");
+
+        // Verify signature: scoped to (data_id || verdict_json) to prevent replay
+        let scoped_message = format!("{}:{}", data_id_hex, verdict_json);
+        let sig_len = signature.len();
+        let sig_bytes: [u8; 64] = signature.try_into().unwrap_or_else(|_| {
+            panic!("Signature must be 64 bytes, got {}", sig_len)
+        });
+
+        let pubkey_bytes = hex::decode(&verifier.public_key).unwrap_or_else(|_| {
+            panic!("Invalid pubkey hex for verifier {}", verifier.account_id)
+        });
+        let pubkey: [u8; 32] = pubkey_bytes.try_into().unwrap_or_else(|_| {
+            panic!("Pubkey must be 32 bytes for verifier {}", verifier.account_id)
+        });
+
+        assert!(
+            env::ed25519_verify(&sig_bytes, scoped_message.as_bytes(), &pubkey),
+            "Invalid signature from verifier {}",
+            verifier.account_id
+        );
+
+        // Double-resume guard
+        let matching_job = self.data_id_index.get(&data_id_hex);
+        if let Some(ref jid) = matching_job {
+            let escrow = self.escrows.get(jid).expect("escrow vanished during index lookup");
+            assert!(!escrow.yield_consumed, "Yield already consumed");
+        }
+
+        // Decode data_id
+        assert!(data_id_hex.len() == 64, "data_id must be 64 hex chars");
+        let data_id_bytes: Vec<u8> = (0..64)
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&data_id_hex[i..i + 2], 16)
+                    .unwrap_or_else(|_| panic!("Invalid hex at position {}", i))
+            })
+            .collect();
+        let data_id: [u8; 32] = data_id_bytes.try_into().expect("data_id must be 32 bytes");
+
+        // Resume yield — payload is the verdict JSON
+        let payload = verdict_json.as_bytes();
+        env::promise_yield_resume(&data_id, payload);
+
+        true
+    }
+
     /// Count valid ed25519 signatures from active verifiers.
     /// Returns usize to avoid u8 overflow. Silently skips invalid pubkeys.
     fn count_valid_signatures(

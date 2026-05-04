@@ -38,6 +38,8 @@ pub struct TaskEvent {
     pub category: Option<String>,
     pub skills: Vec<String>,
     pub description: String,
+    /// SHA-256 hash of verify/ directory contents (from Nostr tag or MANIFEST).
+    pub verify_hash: Option<String>,
 }
 
 impl TaskEvent {
@@ -65,6 +67,7 @@ impl TaskEvent {
             category: get_tag(&event.tags, "category"),
             skills: get_tags(&event.tags, "skills"),
             description: event.content.clone(),
+            verify_hash: get_tag(&event.tags, "verify_hash"),
         })
     }
 }

@@ -31,6 +31,8 @@ pub struct Verifier {
     task_repos: Arc<Mutex<HashMap<String, String>>>,
     /// Map job_id → original task event ID (for VERIFIED event linking)
     task_event_ids: Arc<Mutex<HashMap<String, nostr_sdk::prelude::EventId>>>,
+    /// Map job_id → verify_hash (from TASK events, for verify/ integrity check)
+    task_verify_hashes: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Verifier {
@@ -67,6 +69,7 @@ impl Verifier {
             processed: Arc::new(Mutex::new(HashMap::new())),
             task_repos: Arc::new(Mutex::new(HashMap::new())),
             task_event_ids: Arc::new(Mutex::new(HashMap::new())),
+            task_verify_hashes: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -100,18 +103,27 @@ impl Verifier {
         }
     }
 
-    /// Handle kind 41000 (TASK) — store repo_rid mapping for later use.
+    /// Handle kind 41000 (TASK) — store repo_rid and verify_hash for later use.
     async fn handle_task_event(&self, task: TaskEvent) -> Result<()> {
         let mut repos = self.task_repos.lock().await;
         let mut event_ids = self.task_event_ids.lock().await;
+        let mut hashes = self.task_verify_hashes.lock().await;
 
         repos.insert(task.job_id.clone(), task.repo_rid.clone());
         event_ids.insert(task.job_id.clone(), task.event_id);
 
-        info!(
-            "📝 Tracked task: {} → repo_rid={}",
-            task.job_id, task.repo_rid
-        );
+        if let Some(ref vh) = task.verify_hash {
+            hashes.insert(task.job_id.clone(), vh.clone());
+            info!(
+                "📝 Tracked task: {} → repo_rid={}, verify_hash={}",
+                task.job_id, task.repo_rid, vh
+            );
+        } else {
+            info!(
+                "📝 Tracked task: {} → repo_rid={} (no verify_hash — will check MANIFEST)",
+                task.job_id, task.repo_rid
+            );
+        }
 
         Ok(())
     }
@@ -129,13 +141,13 @@ impl Verifier {
 
     /// Handle kind 41002 (WORKER_RESULT) — the core verification pipeline.
     ///
-    /// Fork+patch flow:
+    /// Flow with verify_hash:
     ///   1. Worker forks the agent's repo, commits output/ to their fork
     ///   2. Worker submits a Radicle patch (rad patch), posts kind 41002 with patch_id
     ///   3. Verifier clones the agent's repo, checks out the worker's patch
-    ///   4. Verifier runs agent's verify/ against worker's output/ in Docker sandbox
-    ///
-    /// The worker never has push access to the agent's repo, so verify/ is tamper-proof.
+    ///   4. Verifier computes SHA-256 of verify/ in the checkout, compares against verify_hash
+    ///   5. If hash matches: run verify.sh in Docker sandbox (single mount)
+    ///   6. If hash mismatches: reject (worker tampered with verify/)
     async fn handle_worker_result(&self, result: WorkerResultEvent) -> Result<()> {
         let job_id = result.job_id.clone();
         let patch_id = result.patch_id.clone();
@@ -185,7 +197,13 @@ impl Verifier {
             }
         };
 
-        // 2. Clone the agent's Radicle repo (contains MANIFEST, input/, verify/)
+        // 2. Look up expected verify_hash (from TASK event or MANIFEST)
+        let expected_hash = {
+            let hashes = self.task_verify_hashes.lock().await;
+            hashes.get(&job_id).cloned()
+        };
+
+        // 3. Clone the agent's Radicle repo (contains MANIFEST, input/, verify/)
         let repo_dir = match self.radicle.clone_repo(&repo_rid) {
             Ok(dir) => dir,
             Err(e) => {
@@ -194,17 +212,7 @@ impl Verifier {
             }
         };
 
-        // 3. Save the agent's base commit (main/master HEAD) for verify/ reference
-        let base_commit = match self.radicle.base_commit(&repo_dir) {
-            Ok(sha) => sha,
-            Err(e) => {
-                warn!("Could not determine base commit: {:?}. Using current HEAD.", e);
-                self.radicle.head_commit(&repo_dir).unwrap_or_default()
-            }
-        };
-        info!("Agent base commit: {}", base_commit);
-
-        // 4. Checkout the worker's patch — creates a local branch with the worker's output
+        // 4. Checkout the worker's patch — this gives us the worker's output/ + agent's verify/
         let patch_commit = match self.radicle.checkout_patch(&repo_dir, &patch_id) {
             Ok(sha) => sha,
             Err(e) => {
@@ -222,17 +230,70 @@ impl Verifier {
             }
         };
 
-        // 5. Read MANIFEST.json from the agent's base commit (not the worker's patch!)
-        let manifest: Option<serde_json::Value> = self.radicle.read_file_at_commit(
-            &repo_dir, &base_commit, "MANIFEST.json"
-        ).ok()
+        // 5. Read MANIFEST.json from the checkout
+        let manifest: Option<serde_json::Value> = self.radicle.read_file(&repo_dir, "MANIFEST.json")
+            .ok()
             .and_then(|c| serde_json::from_str(&c).ok());
 
-        // 6. Check if verify.sh exists in the agent's base commit
-        let has_verify_script = self.radicle.read_file_at_commit(
-            &repo_dir, &base_commit, "verify/verify.sh"
-        ).is_ok();
+        // 6. Resolve expected verify_hash: TASK event tag → MANIFEST.json verification.verify_hash
+        let expected_hash = expected_hash.or_else(|| {
+            manifest
+                .as_ref()
+                .and_then(|m| m.get("verification"))
+                .and_then(|v| v.get("verify_hash"))
+                .and_then(|h| h.as_str())
+                .map(|h| h.to_string())
+        });
 
+        // 7. Verify integrity of verify/ via hash
+        let verify_dir = repo_dir.join("verify");
+        if verify_dir.exists() {
+            match crate::radicle::hash_directory(&verify_dir) {
+                Ok(actual_hash) => {
+                    if let Some(ref expected) = expected_hash {
+                        if actual_hash != *expected {
+                            error!(
+                                "🔒 verify_hash MISMATCH for job {}! Expected={}, Got={}",
+                                job_id, expected, actual_hash
+                            );
+                            // Reject — worker may have tampered with verify/
+                            // Still post a VERIFIED event with passed=false
+                            let original_event_id = {
+                                let event_ids = self.task_event_ids.lock().await;
+                                event_ids.get(&job_id).copied()
+                            };
+                            if let Some(event_id) = original_event_id {
+                                if let Err(e) = self.nostr.post_verified(
+                                    &event_id,
+                                    &job_id,
+                                    &self.config.verifier_account_id,
+                                    &self.config.verifier_did,
+                                    &patch_id,
+                                    false,
+                                    0,
+                                    "hash_check",
+                                    0,
+                                    &format!("verify_hash mismatch: expected {}", expected),
+                                ).await {
+                                    error!("Failed to post tamper-detected VERIFIED: {:?}", e);
+                                }
+                            }
+                            return Ok(());
+                        }
+                        info!("✓ verify_hash matches: {}", actual_hash);
+                    } else {
+                        warn!("No verify_hash for job {} — skipping integrity check (worker trusted)", job_id);
+                    }
+                }
+                Err(e) => {
+                    warn!("Failed to hash verify/ directory: {:?}. Continuing without check.", e);
+                }
+            }
+        } else {
+            warn!("No verify/ directory in checkout for job {}", job_id);
+        }
+
+        // 8. Determine verification method
         let verify_method = manifest
             .as_ref()
             .and_then(|m| m.get("verification"))
@@ -240,14 +301,10 @@ impl Verifier {
             .and_then(|m| m.as_str())
             .unwrap_or("test_suite");
 
-        // The patch checkout dir contains the worker's output/ — we pass it
-        // to the executor so it mounts verify/ from base and output/ from patch.
-        let patch_dir = repo_dir.as_path();
+        let has_verify_script = repo_dir.join("verify").join("verify.sh").exists();
 
         let verification_result = match verify_method {
             "test_suite" | "deterministic" if has_verify_script => {
-                // First, checkout base commit to get clean verify/ for docker mount
-                self.radicle.checkout_commit(&repo_dir, &base_commit)?;
                 let runtime_image = manifest
                     .as_ref()
                     .and_then(|m| m.get("execution"))
@@ -255,7 +312,7 @@ impl Verifier {
                     .and_then(|r| r.as_str())
                     .unwrap_or(&self.config.default_image);
 
-                self.executor.verify_with_image(&repo_dir, runtime_image, Some(patch_dir))?
+                self.executor.verify_with_image(&repo_dir, runtime_image)?
             }
             "llm_judge" => {
                 // Fall back to LLM scoring (no verify.sh needed)

@@ -28,6 +28,7 @@
         ["category",        "<coding|writing|research|analysis|ml|data|...>"],
         ["skills",          "<skill1>", "<skill2>", "..."],
         ["task_type",       "<code|document|data|prompt|mixed>"]
+        ["verify_hash", "<sha256:hex> — SHA-256 hash of verify/ directory contents for integrity check"]
       ],
       "content": "Brief human-readable task description (for discovery). Full spec is in the Radicle repo.",
       "content_example": "Train a sentiment classifier on the provided tweet dataset. See repo for MANIFEST.json, input data, and verify scripts.",
@@ -163,6 +164,7 @@
       ["score_threshold", "80"],
       ["category", "ml"],
       ["skills", "python", "nlp", "training"]
+      ["verify_hash", "sha256:a3f2b8c1d4e5f67890abcdef1234567890abcdef1234567890abcdef12345678"]
     ],
     "content": "Train a sentiment classifier. Repo contains dataset, training script, and verification tests."
   },

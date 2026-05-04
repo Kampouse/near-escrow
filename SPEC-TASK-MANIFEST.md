@@ -62,7 +62,9 @@ This spec defines a **task manifest** — a JSON document pinned to IPFS/Arweave
     "criteria": "All tests pass. F1 > 0.85.",
     "threshold": 0.85,                   // minimum score (for llm_judge, 0.0-1.0)
     "judge_prompt": null,                // for llm_judge: evaluation prompt template
-    "reviewers": null                    // for human_review: list of reviewer account IDs
+    "reviewers": null,                   // for human_review: list of reviewer account IDs
+    "verify_hash": "sha256:a3f2b8c1d4e5f6..."
+    // SHA-256 hash of verify/ directory contents (agent computes at task creation)
   },
 
   // --- PAYMENT ---

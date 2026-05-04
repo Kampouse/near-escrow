@@ -128,7 +128,9 @@ task-repo/
     "method": "test_suite",
     "entrypoint": "/verify/verify.sh",
     "timeout_seconds": 120,
-    "criteria": "All tests pass. F1 > 0.85."
+    "criteria": "All tests pass. F1 > 0.85.",
+    "verify_hash": "sha256:a3f2b8c1d4e5f6..."
+    // integrity hash of verify/ directory (agent computes at task creation)
   }
 }
 ```
@@ -235,11 +237,21 @@ Verifier            Nostr Relay          NEAR
   │  <patch_id>        │                    │
   │ (gets worker code) │                    │
   │                    │                    │
-  │ docker run         │                    │
-  │  -v agent_main:/task/verify (read-only) │
-  │  -v patch_co:/task/output (read-only)   │
-  │  verify.sh         │                    │
-  │  (sandboxed)       │                    │
+  │ Compute SHA-256    │                    │
+  │  of verify/ in     │                    │
+  │  checkout          │                    │
+  │                    │                    │
+  │ Compare hash vs    │                    │
+  │  verify_hash from  │                    │
+  │  Nostr/MANIFEST    │                    │
+  │                    │                    │
+  │ If match:          │                    │
+  │  docker run        │                    │
+  │   -v checkout:/task:ro                  │
+  │   verify.sh        │                    │
+  │   (sandboxed)      │                    │
+  │ If mismatch:       │                    │
+  │  REJECT (tampering)│                    │
   │                    │                    │
   │ Sign verdict       │                    │
   │ (ed25519)          │                    │
@@ -258,11 +270,7 @@ Verifier            Nostr Relay          NEAR
 
 ## Verification Methods
 
-The verifier mounts two separate trees into the verification container:
-- **verify/** (from agent's main branch) — the agent's test logic, read-only
-- **output/** (from worker's patch checkout) — the worker's deliverable, read-only
-
-This separation ensures the worker cannot tamper with verification logic.
+The verifier checks out the worker's patch and verifies the integrity of verify/ by comparing its SHA-256 hash against the verify_hash recorded in the task event. This ensures the worker cannot tamper with verification logic — any modification to verify/ would change the hash.
 
 ### Deterministic (exit code + hash comparison)
 ```bash
@@ -335,7 +343,7 @@ No REST API. All coordination through Nostr events.
 ### executor (Container runtime)
 
 Spawns Docker/Podman containers to run verification:
-- Mounts agent's verify/ from main branch (read-only) + worker's output/ from patch checkout (read-only) into container
+- Mounts the checked-out repo (single mount) after verifying verify/ integrity via hash
 - Enforces resource limits (memory, CPU, timeout, no network)
 - Captures stdout/stderr/exit code
 - Returns structured result: {passed, exit_code, output, duration}
@@ -444,7 +452,7 @@ Trusted:                    Untrusted:
   • NEAR contract             • Worker output (validated by verify.sh)
   • Radicle protocol          • LLM judge (can be gamed)
   • Nostr event signatures    • External network (disabled in sandbox)
-  • Agent verify/ (main branch, worker cannot modify)
+  • Agent verify/ (integrity verified by verify_hash — worker cannot modify without detection)
   • Worker submits via fork+patch (never touches main repo)
 ```
 
@@ -518,3 +526,4 @@ But for v1, the verifier does everything: host, verify, sign, earn the full fee.
 | Verifier discovery | Nostr kind 41000 events (verifier_did tag). |
 | Result provenance | patch_id in kind 41002 tags links on-chain result to Radicle patch. |
 | Fork+patch vs direct push | Workers fork the repo and submit patches. Agent NEVER adds worker DID to repo. Verifier checks out patch via `rad patch checkout <patch_id>` and mounts verify/ from main branch separately. Prevents worker from tampering with verification logic. |
+| verify/ integrity | verify_hash: agent pre-computes SHA-256 of verify/ contents, stores in MANIFEST + Nostr event. Verifier recomputes and compares. Single checkout, single mount. |

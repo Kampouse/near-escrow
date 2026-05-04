@@ -42,9 +42,8 @@ impl DockerExecutor {
     }
 
     /// Run verify.sh in a sandboxed Docker container.
-    /// Uses two mounts: agent repo (verify/) read-only, patch checkout (output/) read-only.
-    /// This prevents the worker from tampering with verify.sh.
-    pub fn verify(&self, repo_dir: &Path, patch_dir: Option<&Path>) -> Result<VerificationResult> {
+    /// Single mount: the entire checked-out repo (verify/ integrity verified via hash before this call).
+    pub fn verify(&self, repo_dir: &Path) -> Result<VerificationResult> {
         // Read manifest for execution config
         let manifest = read_manifest(repo_dir).ok();
         let verify_config = manifest
@@ -85,11 +84,8 @@ impl DockerExecutor {
 
         let start = Instant::now();
 
-        // Build docker args with two mounts:
-        //   - Agent repo (main branch) mounted at /task — contains MANIFEST, input/, verify/
-        //   - Worker patch checkout mounted at /output — contains worker's output/
-        // This ensures verify/ comes from the agent, not the worker.
-        let mut docker_args = vec![
+        // Single mount: the whole repo at /task (verify/ integrity already checked via hash)
+        let docker_args = vec![
             "run".to_string(),
             "--rm".to_string(),
             "--network".to_string(), "none".to_string(),
@@ -98,23 +94,10 @@ impl DockerExecutor {
             "--read-only".to_string(),
             "--tmpfs".to_string(), "/tmp:size=100m".to_string(),
             "-v".to_string(), format!("{}:/task:ro", repo_dir.display()),
-        ];
-
-        // If we have a separate patch checkout, mount it as /task/output
-        if let Some(pdir) = patch_dir {
-            let output_path = pdir.join("output");
-            if output_path.exists() {
-                docker_args.push("-v".to_string());
-                docker_args.push(format!("{}:/task/output:ro", output_path.display()));
-                info!("Two-mount: verify/ from agent repo, output/ from patch checkout");
-            }
-        }
-
-        docker_args.extend([
             "-w".to_string(), "/task".to_string(),
             self.default_image.clone(),
             "bash".to_string(), "verify/verify.sh".to_string(),
-        ]);
+        ];
 
         let output = Command::new("docker")
             .args(&docker_args)
@@ -145,8 +128,8 @@ impl DockerExecutor {
     }
 
     /// Run verification with a specific container image (from MANIFEST.json execution.runtime).
-    /// Uses two mounts: agent repo for verify/, patch checkout for output/.
-    pub fn verify_with_image(&self, repo_dir: &Path, image: &str, patch_dir: Option<&Path>) -> Result<VerificationResult> {
+    /// Single mount: the entire checked-out repo.
+    pub fn verify_with_image(&self, repo_dir: &Path, image: &str) -> Result<VerificationResult> {
         let verify_script = repo_dir.join("verify").join("verify.sh");
 
         if !verify_script.exists() {
@@ -164,8 +147,8 @@ impl DockerExecutor {
 
         let start = Instant::now();
 
-        // Build docker args with two mounts
-        let mut docker_args = vec![
+        // Single mount: the whole repo at /task (verify/ integrity already checked via hash)
+        let docker_args = vec![
             "run".to_string(),
             "--rm".to_string(),
             "--network".to_string(), "none".to_string(),
@@ -174,22 +157,10 @@ impl DockerExecutor {
             "--read-only".to_string(),
             "--tmpfs".to_string(), "/tmp:size=100m".to_string(),
             "-v".to_string(), format!("{}:/task:ro", repo_dir.display()),
-        ];
-
-        // Mount worker's output/ from patch checkout
-        if let Some(pdir) = patch_dir {
-            let output_path = pdir.join("output");
-            if output_path.exists() {
-                docker_args.push("-v".to_string());
-                docker_args.push(format!("{}:/task/output:ro", output_path.display()));
-            }
-        }
-
-        docker_args.extend([
             "-w".to_string(), "/task".to_string(),
             image.to_string(),
             "bash".to_string(), "verify/verify.sh".to_string(),
-        ]);
+        ];
 
         let output = Command::new("docker")
             .args(&docker_args)

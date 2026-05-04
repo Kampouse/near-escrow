@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use sha2::{Sha256, Digest};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use tracing::{info, warn, error};
@@ -172,6 +173,50 @@ impl RadicleClient {
 
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
+}
+
+/// Compute a deterministic SHA-256 hash of all files in a directory.
+/// Files are sorted by relative path, then each file's content is hashed
+/// into a cumulative SHA-256. Returns hex-encoded hash with "sha256:" prefix.
+pub fn hash_directory(dir: &Path) -> Result<String> {
+    let mut all_files = Vec::new();
+    collect_files(dir, dir, &mut all_files)?;
+    all_files.sort();
+
+    let mut hasher = Sha256::new();
+    for (rel_path, full_path) in &all_files {
+        // Feed relative path then file content into the hash
+        hasher.update(rel_path.as_bytes());
+        hasher.update(b"\0");
+        let content = std::fs::read(full_path)
+            .with_context(|| format!("Failed to read {}", full_path.display()))?;
+        hasher.update(&content);
+        hasher.update(b"\0");
+    }
+
+    let hash = hasher.finalize();
+    Ok(format!("sha256:{:x}", hash))
+}
+
+/// Recursively collect all files under a directory.
+fn collect_files(base: &Path, dir: &Path, files: &mut Vec<(String, PathBuf)>) -> Result<()> {
+    for entry in std::fs::read_dir(dir)
+        .with_context(|| format!("Failed to read dir {}", dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(base, &path, files)?;
+        } else {
+            let rel = path
+                .strip_prefix(base)
+                .unwrap_or(&path)
+                .to_string_lossy()
+                .to_string();
+            files.push((rel, path));
+        }
+    }
+    Ok(())
 }
 
 /// Sanitize a Radicle RID to be a valid directory name.
